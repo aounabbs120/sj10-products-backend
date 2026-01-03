@@ -101,61 +101,105 @@ exports.getAllProducts = async (req, res) => {
     try {
         const { search, category, supplierId, limit = 40 } = req.query;
         let results = [];
+        
+        // This array will hold any connection errors we find
+        const debugErrors = [];
 
+        // CASE A: CATEGORY FILTER
         if (category) {
             const [catRows] = await db.inventory.query("SELECT db_shard FROM categories WHERE id = ?", [category]);
             if (catRows.length > 0) {
                 const shardKey = catRows[0].db_shard || 'shard_general';
                 const client = clients[shardKey] || clients.shard_general;
-                const res = await client.execute({
-                    sql: `SELECT * FROM products WHERE category_id = ? AND status = 'in_stock' ORDER BY created_at DESC LIMIT ?`,
-                    args: [category, parseInt(limit)]
-                });
-                results = res.rows;
+                try {
+                    const res = await client.execute({
+                        sql: `SELECT * FROM products WHERE category_id = ? AND status = 'in_stock' ORDER BY created_at DESC LIMIT ?`,
+                        args: [category, parseInt(limit)]
+                    });
+                    results = res.rows;
+                } catch (e) {
+                    debugErrors.push({ shard: shardKey, error: e.message });
+                }
             }
-        } else if (supplierId) {
-            results = await queryAllShards(
-                `SELECT * FROM products WHERE supplier_id = ? AND status = 'in_stock' ORDER BY created_at DESC LIMIT ${parseInt(limit)}`, 
-                [supplierId]
-            );
-        } else if (search) {
-            results = await queryAllShards(
-                `SELECT * FROM products WHERE title LIKE ? AND status = 'in_stock' LIMIT 15`, 
-                [`%${search}%`]
-            );
-        } else {
-    const itemsPerShard = Math.ceil(parseInt(limit) / 10) + 2; 
-    const sql = `SELECT * FROM products WHERE status = 'in_stock' ORDER BY created_at DESC LIMIT ${itemsPerShard}`;
-    
-    // --- DEBUGGING CODE START ---
-    const allPromises = Object.entries(clients).map(async ([key, client]) => {
-        try {
-            console.log(`Testing Shard: ${key}`); // Log which shard we are trying
-            const res = await client.execute(sql);
-            console.log(`✅ Success: ${key}`);
-            return res;
-        } catch (e) {
-            // Log the specific failure so we know which Token is wrong
-            console.error(`❌ FAILED Shard: [${key}] - Error: ${e.message}`);
-            return { rows: [] }; // Return empty so other shards still load!
         }
-    });
+        
+        // CASE B: SUPPLIER
+        else if (supplierId) {
+            // We use the helper, but wrap in try/catch in case it fails silently
+            try {
+                results = await queryAllShards(
+                    `SELECT * FROM products WHERE supplier_id = ? AND status = 'in_stock' ORDER BY created_at DESC LIMIT ${parseInt(limit)}`, 
+                    [supplierId]
+                );
+            } catch (e) {
+                console.error("Supplier Query Error:", e);
+            }
+        }
+        
+        // CASE C: SEARCH
+        else if (search) {
+             try {
+                results = await queryAllShards(
+                    `SELECT * FROM products WHERE title LIKE ? AND status = 'in_stock' LIMIT 15`, 
+                    [`%${search}%`]
+                );
+             } catch (e) {
+                console.error("Search Query Error:", e);
+             }
+        }
+        
+        // CASE D: EXPLORE ALL (DIAGNOSTIC MODE)
+        else {
+            const itemsPerShard = Math.ceil(parseInt(limit) / 10) + 2; 
+            const sql = `SELECT * FROM products WHERE status = 'in_stock' ORDER BY created_at DESC LIMIT ${itemsPerShard}`;
+            
+            // 🔥 DEBUGGING LOGIC START 🔥
+            // Map over shards to find EXACTLY which one is broken
+            const allPromises = Object.entries(clients).map(async ([key, client]) => {
+                try {
+                    const res = await client.execute(sql);
+                    return res.rows;
+                } catch (e) {
+                    // Log the error for Vercel Console
+                    console.error(`❌ FAILED Shard: [${key}] - Error: ${e.message}`);
+                    
+                    // Add to our debug list to show you in the browser
+                    debugErrors.push({ shard: key, error: e.message });
+                    
+                    return []; // Return empty so the site DOES NOT CRASH
+                }
+            });
+
             const allRes = await Promise.all(allPromises);
-            allRes.forEach(r => { if(r.rows) results.push(...r.rows); });
+            
+            // Combine results from working shards
+            allRes.forEach(rows => results.push(...rows));
+            
+            // Sort valid results
             results.sort((a,b) => new Date(b.created_at) - new Date(a.created_at));
             results = results.slice(0, parseInt(limit));
         }
 
-        // ⚡ CACHE FOR 5 MINUTES ⚡
+        // 🚨 IF ERRORS EXIST, SEND DIAGNOSTIC REPORT 🚨
+        if (debugErrors.length > 0) {
+            console.log("⚠️ Sending Diagnostic Report to Browser");
+            return res.status(200).json({ 
+                message: "⚠️ WARNING: Connection Failed for specific shards",
+                failed_shards: debugErrors, // <--- READ THIS IN YOUR BROWSER TO FIND THE BAD TOKEN
+                products: results.map(p => parseProduct(p)) 
+            });
+        }
+
+        // Standard Success Response
         res.set('Cache-Control', 'public, s-maxage=300, stale-while-revalidate=30');
         res.status(200).json({ products: results.map(p => parseProduct(p)) });
 
     } catch (e) {
-        console.error("Explore Error:", e);
-        res.status(200).json({ products: [] });
+        console.error("Explore Critical Error:", e);
+        // Even in critical error, try to return empty list instead of 500
+        res.status(200).json({ products: [], error: e.message });
     }
 };
-
 /* ======================================================
    3. SINGLE PRODUCT DETAIL
    ====================================================== */
