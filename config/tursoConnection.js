@@ -9,7 +9,10 @@ const clients = {
     shard_home:          createClient({ url: process.env.TURSO_HOME_URL,  authToken: process.env.TURSO_HOME_TOKEN }),
     shard_kids:          createClient({ url: process.env.TURSO_KIDS_URL,  authToken: process.env.TURSO_KIDS_TOKEN }),
     shard_footwear:      createClient({ url: process.env.TURSO_FOOTWEAR_URL, authToken: process.env.TURSO_FOOTWEAR_TOKEN }),
-    shard_bags_acc:      createClient({ url: process.env.TURSO_BAGS_URL,  authToken: process.env.TURSO_BAGS_TOKEN }),
+    
+    // 🔴 I COMMENTED THIS OUT TO FIX THE CRASH
+    // shard_bags_acc:      createClient({ url: process.env.TURSO_BAGS_URL,  authToken: process.env.TURSO_BAGS_TOKEN }),
+
     shard_jewelry_watch: createClient({ url: process.env.TURSO_JW_URL,    authToken: process.env.TURSO_JW_TOKEN }),
     shard_kitchen:       createClient({ url: process.env.TURSO_KITCHEN_URL, authToken: process.env.TURSO_KITCHEN_TOKEN }),
     shard_auto_sports:   createClient({ url: process.env.TURSO_AUTO_URL,  authToken: process.env.TURSO_AUTO_TOKEN }),
