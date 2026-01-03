@@ -25,7 +25,7 @@ const clients = {
   shard_bags_acc:      safeCreateClient(process.env.TURSO_BAGS_URL,  process.env.TURSO_BAGS_TOKEN),
   shard_jewelry_watch: safeCreateClient(process.env.TURSO_JW_URL,    process.env.TURSO_JW_TOKEN),
   shard_kitchen:       safeCreateClient(process.env.TURSO_KITCHEN_URL, process.env.TURSO_KITCHEN_TOKEN),
-  shard_auto_sports:   safeCreateClient(process.env.TURSO_AUTO_URL,  process.env.TURSO_AUTO_TOKEN),
+  //shard_auto_sports:   safeCreateClient(process.env.TURSO_AUTO_URL,  process.env.TURSO_AUTO_TOKEN),
   shard_general:       safeCreateClient(process.env.TURSO_GEN_URL,   process.env.TURSO_GEN_TOKEN),
 };
 
