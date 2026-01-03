@@ -1,0 +1,18 @@
+{
+  "name": "sj10-products-backend",
+  "version": "1.0.0",
+  "main": "api/index.js",
+  "scripts": {
+    "start": "node api/index.js"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.6.0",
+    "axios": "^1.6.0",
+    "compression": "^1.7.4",
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.3",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.0",
+    "mysql2": "^3.6.0"
+  }
+}

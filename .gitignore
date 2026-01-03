@@ -1,0 +1,12 @@
+# Dependencies
+node_modules/
+
+# Environment Variables (VERY IMPORTANT: Never upload secrets!)
+.env
+
+# Vercel output
+.vercel
+
+# Mac/Windows system files
+.DS_Store
+Thumbs.db
