@@ -124,9 +124,22 @@ exports.getAllProducts = async (req, res) => {
                 [`%${search}%`]
             );
         } else {
-            const itemsPerShard = Math.ceil(parseInt(limit) / 10) + 2; 
-            const sql = `SELECT * FROM products WHERE status = 'in_stock' ORDER BY created_at DESC LIMIT ${itemsPerShard}`;
-            const allPromises = Object.values(clients).map(c => c.execute(sql));
+    const itemsPerShard = Math.ceil(parseInt(limit) / 10) + 2; 
+    const sql = `SELECT * FROM products WHERE status = 'in_stock' ORDER BY created_at DESC LIMIT ${itemsPerShard}`;
+    
+    // --- DEBUGGING CODE START ---
+    const allPromises = Object.entries(clients).map(async ([key, client]) => {
+        try {
+            console.log(`Testing Shard: ${key}`); // Log which shard we are trying
+            const res = await client.execute(sql);
+            console.log(`✅ Success: ${key}`);
+            return res;
+        } catch (e) {
+            // Log the specific failure so we know which Token is wrong
+            console.error(`❌ FAILED Shard: [${key}] - Error: ${e.message}`);
+            return { rows: [] }; // Return empty so other shards still load!
+        }
+    });
             const allRes = await Promise.all(allPromises);
             allRes.forEach(r => { if(r.rows) results.push(...r.rows); });
             results.sort((a,b) => new Date(b.created_at) - new Date(a.created_at));
