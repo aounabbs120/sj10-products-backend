@@ -1,12 +1,17 @@
 const { createClient } = require("@libsql/client");
 require("dotenv").config();
 
-/**
- * Create Turso client ONLY if env vars exist
- */
 const safeCreateClient = (url, token) => {
   if (!url || !token) return null;
-  return createClient({ url, authToken: token });
+
+  return createClient({
+    url,
+    authToken: token,
+
+    // 🔴 THIS IS THE FIX 🔴
+    syncUrl: null,
+    syncInterval: 0
+  });
 };
 
 const clients = {
@@ -24,16 +29,12 @@ const clients = {
   shard_general:       safeCreateClient(process.env.TURSO_GEN_URL,   process.env.TURSO_GEN_TOKEN),
 };
 
-// 🧹 REMOVE BROKEN / NULL SHARDS
-Object.keys(clients).forEach(key => {
-  if (!clients[key]) {
-    console.warn(`⚠️ Turso shard skipped: ${key}`);
-    delete clients[key];
-  }
+// Remove broken shards
+Object.keys(clients).forEach(k => {
+  if (!clients[k]) delete clients[k];
 });
 
-const getDbForCategory = (shardKey) => {
-  return clients[shardKey] || clients.shard_general;
-};
+const getDbForCategory = (shardKey) =>
+  clients[shardKey] || clients.shard_general;
 
 module.exports = { clients, getDbForCategory };
