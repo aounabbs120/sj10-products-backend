@@ -97,48 +97,78 @@ exports.getHomepageData = async (req, res) => {
 /* ======================================================
    2. EXPLORE / SEARCH
    ====================================================== */
+/* ======================================================
+   2. EXPLORE / SEARCH (FAIL-SAFE VERSION)
+   ====================================================== */
 exports.getAllProducts = async (req, res) => {
     try {
         const { search, category, supplierId, limit = 40 } = req.query;
         let results = [];
 
+        // CASE A: CATEGORY FILTER
         if (category) {
             const [catRows] = await db.inventory.query("SELECT db_shard FROM categories WHERE id = ?", [category]);
             if (catRows.length > 0) {
                 const shardKey = catRows[0].db_shard || 'shard_general';
                 const client = clients[shardKey] || clients.shard_general;
-                const res = await client.execute({
-                    sql: `SELECT * FROM products WHERE category_id = ? AND status = 'in_stock' ORDER BY created_at DESC LIMIT ?`,
-                    args: [category, parseInt(limit)]
-                });
-                results = res.rows;
+                try {
+                    const res = await client.execute({
+                        sql: `SELECT * FROM products WHERE category_id = ? AND status = 'in_stock' ORDER BY created_at DESC LIMIT ?`,
+                        args: [category, parseInt(limit)]
+                    });
+                    results = res.rows;
+                } catch (e) {
+                    console.error(`[Single Category Fail] Shard: ${shardKey}`, e.message);
+                    // Don't crash, just return empty for this category
+                }
             }
-        } else if (supplierId) {
-            results = await queryAllShards(
-                `SELECT * FROM products WHERE supplier_id = ? AND status = 'in_stock' ORDER BY created_at DESC LIMIT ${parseInt(limit)}`, 
-                [supplierId]
-            );
-        } else if (search) {
-            results = await queryAllShards(
-                `SELECT * FROM products WHERE title LIKE ? AND status = 'in_stock' LIMIT 15`, 
-                [`%${search}%`]
-            );
-        } else {
-            const itemsPerShard = Math.ceil(parseInt(limit) / 10) + 2; 
-            const sql = `SELECT * FROM products WHERE status = 'in_stock' ORDER BY created_at DESC LIMIT ${itemsPerShard}`;
-            const allPromises = Object.values(clients).map(c => c.execute(sql));
+        }
+        // CASE B: SEARCH OR EXPLORE (MULTI-SHARD)
+        else {
+            let sql = "";
+            let args = [];
+
+            if (supplierId) {
+                sql = `SELECT * FROM products WHERE supplier_id = ? AND status = 'in_stock' ORDER BY created_at DESC LIMIT ${parseInt(limit)}`;
+                args = [supplierId];
+            } else if (search) {
+                sql = `SELECT * FROM products WHERE title LIKE ? AND status = 'in_stock' LIMIT 15`;
+                args = [`%${search}%`];
+            } else {
+                const itemsPerShard = Math.ceil(parseInt(limit) / 10) + 2; 
+                sql = `SELECT * FROM products WHERE status = 'in_stock' ORDER BY created_at DESC LIMIT ${itemsPerShard}`;
+            }
+
+            // 🔥 FAIL-SAFE LOGIC: WRAP EACH SHARD IN A TRY-CATCH 🔥
+            const allPromises = Object.entries(clients).map(async ([key, client]) => {
+                try {
+                    const res = await client.execute({ sql, args });
+                    return res.rows;
+                } catch (e) {
+                    console.error(`⚠️ SKIPPING BROKEN SHARD: [${key}] - ${e.message}`);
+                    return []; // Return empty array so the site keeps loading!
+                }
+            });
+
+            // This will wait for all, but NONE will crash now.
             const allRes = await Promise.all(allPromises);
-            allRes.forEach(r => { if(r.rows) results.push(...r.rows); });
+            
+            // Combine all successful results
+            allRes.forEach(rows => {
+                if (rows && Array.isArray(rows)) results.push(...rows);
+            });
+
             results.sort((a,b) => new Date(b.created_at) - new Date(a.created_at));
             results = results.slice(0, parseInt(limit));
         }
 
-        // ⚡ CACHE FOR 5 MINUTES ⚡
+        // Send the data (even if some shards failed)
         res.set('Cache-Control', 'public, s-maxage=300, stale-while-revalidate=30');
         res.status(200).json({ products: results.map(p => parseProduct(p)) });
 
     } catch (e) {
-        console.error("Explore Error:", e);
+        console.error("Explore Critical Error:", e);
+        // Even if the main logic fails, return empty list instead of 500 error
         res.status(200).json({ products: [] });
     }
 };
