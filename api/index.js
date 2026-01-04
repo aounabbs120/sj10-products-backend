@@ -27,3 +27,16 @@ app.get('/', (req, res) => {
 
 // Export for Vercel
 module.exports = app;
+
+// ---------------------------------------------------------
+// 🚀 ADDED FOR LOCALHOST TESTING 🚀
+// This part runs ONLY when you run "node api/index.js" locally
+// ---------------------------------------------------------
+if (require.main === module) {
+    const PORT = process.env.PORT || 4000;
+    app.listen(PORT, () => {
+        console.log(`\n🚀 Server is running locally on: http://localhost:${PORT}`);
+        console.log(`👉 Test Health Check: http://localhost:${PORT}/`);
+        console.log(`👉 Test Products:     http://localhost:${PORT}/api/products`);
+    });
+}
