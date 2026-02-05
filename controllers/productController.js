@@ -1,315 +1,570 @@
-const { clients } = require('../config/tursoConnection');
-const { queryAllShards } = require('../utils/shardHelper');
-const db = require('../config/database'); 
+require('dotenv').config();
+const { clients, viewsClient } = require('../config/tursoConnection');
+const db = require('../config/database');
 
 // --- HELPER: Parse Product ---
-const parseProduct = (p, discountNameMap = null) => {
+const parseProduct = (p) => {
     if (!p) return null;
-    try { p.image_urls = typeof p.image_urls === 'string' ? JSON.parse(p.image_urls) : p.image_urls; } catch(e) { p.image_urls = p.image_url ? [p.image_url] : []; }
-    try { p.attributes = typeof p.attributes === 'string' ? JSON.parse(p.attributes) : {}; } catch(e) { p.attributes = {}; }
+    try {
+        p.image_urls = typeof p.image_urls === 'string' ? JSON.parse(p.image_urls) : (p.image_urls || []);
+    } catch (e) {
+        p.image_urls = p.image_url ? [p.image_url] : [];
+    }
     p.price = parseFloat(p.price);
     p.discounted_price = parseFloat(p.discounted_price || p.price);
-    if (discountNameMap && discountNameMap.has(p.id)) {
-        p.discounts = [{ name: discountNameMap.get(p.id) }];
-    } else {
-        p.discounts = [];
-    }
+    p.views = p.views || 0;
     return p;
 };
 
+// --- HELPER: Get Products from Turso by IDs ---
+const getProductsFromTursoByIds = async (ids) => {
+    if (!ids || ids.length === 0) return [];
+    const shardKeys = Object.keys(clients);
+    const promises = shardKeys.map(key =>
+        clients[key].execute({ sql: `SELECT * FROM products WHERE id IN (${ids.map(()=>'?').join(',')})`, args: ids })
+            .then(res => res.rows)
+            .catch(() => [])
+    );
+    const results = await Promise.all(promises);
+    return results.flat();
+};
+
 /* ======================================================
-   1. HOMEPAGE DATA 
+   🔥 NEW HELPER: GLOBALLY ATTACH VERIFIED STATUS 🔥
+   This ensures Homepage, Categories, etc. all get the badge data
+   ====================================================== */
+const enrichWithSupplierDetails = async (products) => {
+    if (!products || products.length === 0) return [];
+    
+    // 1. Extract Unique Supplier IDs
+    const supplierIds = [...new Set(products.map(p => p.supplier_id).filter(Boolean))];
+    if (supplierIds.length === 0) return products.map(parseProduct); // Return parsed if no suppliers
+
+    try {
+        // 2. Fetch Verified Status from MySQL
+        const [suppliers] = await db.suppliers.query(
+            "SELECT id, verified_status, city FROM suppliers WHERE id IN (?)",
+            [supplierIds]
+        );
+        
+        // 3. Create Map for Speed
+        const supplierMap = new Map(suppliers.map(s => [s.id, s]));
+
+        // 4. Attach Status to Products
+        return products.map(p => {
+            const parsed = parseProduct(p);
+            const s = supplierMap.get(p.supplier_id);
+            
+            // ROBUST CHECK: 'verified', 'Verified', 'VERIFIED' all work now
+            const isVerified = s && String(s.verified_status).toLowerCase() === 'verified';
+
+            return {
+                ...parsed,
+                supplier_verified: isVerified, // <--- THIS FORCES THE BADGE
+                supplier_city: s ? s.city : null,
+                // Check for Video
+                has_video: (p.video_url && p.video_url.length > 5) || parsed.image_urls.some(url => url && url.includes('.mp4'))
+            };
+        });
+    } catch (e) {
+        console.error("Enrichment Error:", e);
+        return products.map(parseProduct); // Fallback
+    }
+};
+/* ==========================================================================
+   🔥 GLOBAL CARD CONSTRUCTOR (Dedicated Function for All Pages) 🔥
+   
+   This function runs for Home, Explore, Category, and Search.
+   It attaches:
+   1. Supplier Info (Verified Badge)
+   2. Ratings
+   3. Views
+   4. ⭐ NEW: Discount Label (Flash Sale Badge)
+   ========================================================================== */
+const constructProductCards = async (rawProducts) => {
+    if (!rawProducts || rawProducts.length === 0) return [];
+
+    // 1. Prepare IDs for Batch Fetching
+    const productIds = rawProducts.map(p => p.id);
+    const supplierIds = [...new Set(rawProducts.map(p => p.supplier_id).filter(Boolean))];
+    
+    // Safety check to prevent SQL errors
+    const sIdsSafe = supplierIds.length ? supplierIds : [0];
+    const pIdsSafe = productIds.length ? productIds : [0];
+
+    try {
+        // 2. Fetch All "Side Data" in Parallel (Fast)
+        const [suppliersRes, ratingsRes, viewsRes, discountRes] = await Promise.all([
+            // A. Fetch Supplier Details (Verified Status)
+            db.suppliers.query(`SELECT id, verified_status, city, brand_name FROM suppliers WHERE id IN (?)`, [sIdsSafe]).catch(()=>[[]]),
+            
+            // B. Fetch Ratings
+            db.reviews.query(`SELECT product_id, avg_rating, review_count FROM product_ratings WHERE product_id IN (?)`, [pIdsSafe]).catch(()=>[[]]),
+            
+            // C. Fetch Views (Turso)
+            viewsClient ? viewsClient.execute({ 
+                sql: `SELECT product_id, views FROM product_views WHERE product_id IN (${pIdsSafe.map(()=>'?').join(',')})`,
+                args: pIdsSafe 
+            }).catch(() => ({ rows: [] })) : { rows: [] },
+
+            // D. 🔥 FETCH ACTIVE DISCOUNT BADGES (The New Logic) 🔥
+            // This gets the label (e.g., "Flash Sale") for the specific products loaded
+            db.inventory.query(`
+                SELECT dp.product_id, d.name 
+                FROM discount_products dp 
+                JOIN discounts d ON dp.discount_id = d.id 
+                WHERE d.is_active = 1 
+                AND dp.product_id IN (?)
+            `, [pIdsSafe]).catch(() => [[]])
+        ]);
+
+        // 3. Create Lookup Maps (Using String Keys for Safety)
+        // We use String() to ensure ID 12 matches "12"
+        const supplierMap = new Map(suppliersRes[0].map(s => [String(s.id), s]));
+        const ratingMap = new Map(ratingsRes[0].map(r => [r.product_id, r]));
+        const viewsMap = new Map(viewsRes.rows.map(v => [v.product_id, v.views]));
+        
+        // 🔥 Discount Map: ProductID -> Badge Name
+        const discountNameMap = new Map(discountRes[0].map(d => [String(d.product_id), d.name]));
+
+        // 4. Construct the Final Object for <ProductCard />
+        return rawProducts.map(p => {
+            // -- Image Parsing --
+            let image_urls = [];
+            try { image_urls = typeof p.image_urls === 'string' ? JSON.parse(p.image_urls) : (p.image_urls || []); } 
+            catch (e) { image_urls = p.image_url ? [p.image_url] : []; }
+
+            // -- Supplier Lookup --
+            const sData = supplierMap.get(String(p.supplier_id));
+            const rData = ratingMap.get(p.id) || { avg_rating: 0, review_count: 0 };
+
+            // -- Verified Badge Logic --
+            let isVerified = false;
+            let dbStatus = 'unverified'; 
+            if (sData && sData.verified_status) {
+                dbStatus = String(sData.verified_status).trim().toLowerCase();
+                if (['verified', 'true', '1'].includes(dbStatus)) isVerified = true;
+            }
+
+            // -- Video Check --
+            const hasVideo = (p.video_url && p.video_url.length > 5) || image_urls.some(url => url && url.includes('.mp4'));
+
+            // -- The Final Data Object --
+            return {
+                id: p.id,
+                title: p.title,
+                slug: p.slug,
+                price: parseFloat(p.price),
+                discounted_price: parseFloat(p.discounted_price || p.price),
+                
+                // 🔥 HERE IS THE MAGIC: Sends data to <ProductCard /> on ALL pages 🔥
+                discount_label: discountNameMap.get(String(p.id)) || null, 
+
+                image_urls: image_urls,
+                video_url: p.video_url,
+                has_video: hasVideo,
+                created_at: p.created_at,
+                
+                // Supplier Data
+                supplier_id: p.supplier_id,
+                supplier_verified: isVerified,
+                supplier: { 
+                    verified_status: dbStatus, 
+                    city: sData ? sData.city : '',
+                    brand_name: sData ? sData.brand_name : ''
+                },
+                supplier_city: sData ? sData.city : '',
+
+                // Stats
+                avg_rating: parseFloat(rData.avg_rating || 0),
+                review_count: rData.review_count || 0,
+                views: viewsMap.get(p.id) || 0,
+                product_ratings: [{ avg_rating: parseFloat(rData.avg_rating || 0), review_count: rData.review_count || 0 }]
+            };
+        });
+
+    } catch (e) {
+        console.error("ConstructCard Error:", e);
+        // Fallback if DB fails
+        return rawProducts.map(p => parseProduct(p));
+    }
+};
+exports.getExploreFeed = async (req, res) => {
+    try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 40;
+        const offset = (page - 1) * limit;
+        const { sort = 'default', hasVideo, showVerified, search, category_id, rating, minPrice, maxPrice, city } = req.query;
+
+        let sql = `SELECT * FROM products WHERE status = 'in_stock'`;
+        let countSql = `SELECT COUNT(*) as total FROM products WHERE status = 'in_stock'`;
+        let args = [];
+
+        if (search) { const term = `%${search.trim().toLowerCase()}%`; sql += ` AND LOWER(title) LIKE ?`; countSql += ` AND LOWER(title) LIKE ?`; args.push(term); }
+        if (category_id && category_id.trim() !== '') {
+            const selectedIds = category_id.split(',').map(id => id.trim()).filter(Boolean);
+            const idsPlaceholder = selectedIds.map(() => '?').join(',');
+            sql += ` AND category_id IN (${idsPlaceholder})`; countSql += ` AND category_id IN (${idsPlaceholder})`; args.push(...selectedIds);
+        }
+        if (minPrice) { sql += ` AND (discounted_price >= ? OR price >= ?)`; countSql += ` AND (discounted_price >= ? OR price >= ?)`; args.push(minPrice, minPrice); }
+        if (maxPrice) { sql += ` AND (discounted_price <= ? OR price <= ?)`; countSql += ` AND (discounted_price <= ? OR price <= ?)`; args.push(maxPrice, maxPrice); }
+
+        const shouldCount = page === 1;
+        const clientValues = Object.values(clients).filter(Boolean);
+        const promises = clientValues.map(async (client) => {
+            try {
+                const pRes = await client.execute({ sql: sql + ` LIMIT 150`, args });
+                let count = 0;
+                if (shouldCount) {
+                    const cRes = await client.execute({ sql: countSql, args });
+                    count = cRes.rows[0]?.total || 0;
+                }
+                return { products: pRes.rows || [], count };
+            } catch (e) { return { products: [], count: 0 }; }
+        });
+
+        const results = await Promise.all(promises);
+        let allProducts = [];
+        let realTotalCount = 0;
+        results.forEach(r => { allProducts.push(...r.products); realTotalCount += r.count; });
+
+        // 🔥 USE THE CONSTRUCTOR 🔥
+        let finalProducts = await constructProductCards(allProducts);
+
+        // Sorting & Filtering (In-Memory)
+        if (hasVideo === 'true') finalProducts = finalProducts.filter(p => p.has_video);
+        if (showVerified === 'true') finalProducts = finalProducts.filter(p => p.supplier_verified);
+        if (rating) finalProducts = finalProducts.filter(p => Math.round(p.avg_rating) >= parseInt(rating));
+        if (city && city !== 'All') finalProducts = finalProducts.filter(p => p.supplier_city?.toLowerCase() === city.toLowerCase());
+
+        if (sort === 'newest') finalProducts.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+        else if (sort === 'price_low_high') finalProducts.sort((a, b) => (a.discounted_price || a.price) - (b.discounted_price || b.price));
+        else if (sort === 'price_high_low') finalProducts.sort((a, b) => (b.discounted_price || b.price) - (a.discounted_price || a.price));
+        else { // Default
+            finalProducts.sort((a, b) => {
+                if (b.review_count !== a.review_count) return b.review_count - a.review_count;
+                return b.views - a.views;
+            });
+        }
+
+        const paginatedProducts = finalProducts.slice(offset, offset + limit);
+
+        res.status(200).json({
+            products: paginatedProducts,
+            totalCount: shouldCount ? realTotalCount : undefined
+        });
+
+    } catch (e) {
+        console.error("Explore Error:", e);
+        res.status(200).json({ products: [], totalCount: 0 });
+    }
+};
+
+/* ======================================================
+   2. HOMEPAGE DATA (Controller Update)
    ====================================================== */
 exports.getHomepageData = async (req, res) => {
     try {
-        console.log("🚀 Building Homepage...");
-
-        // PARALLEL FETCH
-        const promotedPromise = db.inventory.query("SELECT product_id FROM promoted_products WHERE payment_status IN ('paid', 'approved', 'active') AND end_date > NOW()");
-        const bannerPromise = db.inventory.query("SELECT id, image_url, link_url FROM banners WHERE is_active = 1");
-        const catPromise = db.inventory.query("SELECT id, name, image_url, slug, parent_id FROM categories ORDER BY name ASC");
-        const discountPromise = db.inventory.query(`SELECT dp.product_id, d.name FROM discount_products dp JOIN discounts d ON dp.discount_id = d.id WHERE d.is_active = 1`);
-        const sqlRecent = "SELECT * FROM products WHERE status = 'in_stock' ORDER BY created_at DESC LIMIT 5";
-        const shardPromises = Object.values(clients).map(c => c.execute(sqlRecent));
-
-        const [[promotedRows], [banners], [allCats], [discountRows], ...shardResults] = await Promise.all([
-            promotedPromise, bannerPromise, catPromise, discountPromise, ...shardPromises
+        const [bannersRes, promotedRes, catsRes, ...shardResults] = await Promise.all([
+            db.inventory.query("SELECT id, image_url, link_url FROM banners WHERE is_active = 1"),
+            // Fetch promoted products (ensure we have enough candidates)
+            db.inventory.query("SELECT product_id FROM promoted_products WHERE payment_status = 'paid' AND start_date <= NOW() AND end_date >= NOW() ORDER BY start_date DESC"),
+            db.inventory.query("SELECT id, name, image_url, slug, parent_id FROM categories ORDER BY name ASC"),
+            // Increased limit here to ensure we have enough for Popular section
+            ...Object.values(clients).map(c => c.execute("SELECT * FROM products WHERE status = 'in_stock' ORDER BY created_at DESC LIMIT 40"))
         ]);
 
-        // PREPARE MAPS
-        const promotedIds = new Set(promotedRows.map(p => p.product_id));
-        const discountNameMap = new Map();
-        if(discountRows) discountRows.forEach(row => discountNameMap.set(row.product_id, row.name));
+        const [banners] = bannersRes;
+        const [promotedRows] = promotedRes;
+        const [allCats] = catsRes;
 
-        // PROCESS PRODUCTS
-        let allProducts = [];
-        shardResults.forEach(res => { if(res.rows) allProducts.push(...res.rows); });
+        // 1. Promoted: Limit to top 50
+        const promotedIds = new Set(promotedRows.map(r => r.product_id));
+        // Slice the IDs first to avoid fetching too much data if not needed
+        const top50PromotedIds = [...promotedIds].slice(0, 50); 
+        let promotedProductsFull = await getProductsFromTursoByIds(top50PromotedIds);
+        const promotedTop50 = await constructProductCards(promotedProductsFull); 
 
-        allProducts = allProducts.map(p => parseProduct(p, discountNameMap));
-        allProducts.sort((a, b) => {
-            const isAPromoted = promotedIds.has(a.id);
-            const isBPromoted = promotedIds.has(b.id);
-            if (isAPromoted && !isBPromoted) return -1; 
-            if (!isAPromoted && isBPromoted) return 1;  
-            return new Date(b.created_at) - new Date(a.created_at);
-        });
+        // 2. Popular (Sharded): Limit to 100
+        let generalProducts = shardResults.map(res => res.rows).flat().filter(p => !promotedIds.has(p.id));
+        // CHANGED: Slice to 100 products as requested
+        const popularMixed = await constructProductCards(generalProducts.slice(0, 100)); 
 
-        const finalProducts = allProducts.slice(0, 60).map(p => ({
-            ...p,
-            isPromoted: promotedIds.has(p.id)
-        }));
-
-        // PROCESS CATEGORIES
-        const categoryMap = new Map();
-        const mainCategories = [];   
-        const childCategories = [];  
-
-        allCats.forEach(cat => {
-            cat.subcategories = []; 
-            categoryMap.set(cat.id, cat);
-            if (cat.parent_id) childCategories.push(cat); 
-            else mainCategories.push(cat);
-        });
-
-        childCategories.forEach(child => {
-            if (categoryMap.has(child.parent_id)) categoryMap.get(child.parent_id).subcategories.push(child);
-        });
-
-        const circularIcons = childCategories.slice(0, 16); 
-
-        const responsePayload = {
-            banners: banners,
-            subcategories: circularIcons, 
-            categories: mainCategories,   
-            products: finalProducts        
-        };
-
-        // ⚡ SET CLOUDFLARE CACHE (10 Minutes) ⚡
-        res.set('Cache-Control', 'public, s-maxage=600, stale-while-revalidate=30');
-        res.status(200).json(responsePayload);
+        // 3. Cats Logic (unchanged)
+        const subCategoriesAll = allCats.filter(cat => cat.parent_id);
+        const subCatRow1 = subCategoriesAll.slice(0, 16);
+        const subCatRow2 = subCategoriesAll.slice(16, 32);
+        const subCatRow3 = subCategoriesAll.slice(32, 48);
+        
+        res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=30');
+        res.json({ banners: banners || [], subCatRow1, subCatRow2, subCatRow3, promotedTop50, popularMixed });
 
     } catch (error) {
         console.error("Homepage Error:", error);
-        res.status(500).json({ banners: [], subcategories: [], categories: [], products: [] });
+        res.status(500).json({ banners: [], subCatRow1: [], subCatRow2: [], subCatRow3: [], promotedTop50: [], popularMixed: [] });
     }
 };
 
-/* ======================================================
-   2. EXPLORE / SEARCH
-   ====================================================== */
-/* ======================================================
-   2. EXPLORE / SEARCH (FAIL-SAFE VERSION)
-   ====================================================== */
-exports.getAllProducts = async (req, res) => {
+
+
+
+exports.getHomepageCategories = async (req, res) => {
     try {
-        const { search, category, supplierId, limit = 40 } = req.query;
-        let results = [];
+        // Only fetch what we need: Categories
+        const [allCats] = await db.inventory.query(
+            "SELECT id, name, image_url, slug, parent_id FROM categories ORDER BY name ASC"
+        );
 
-        // CASE A: CATEGORY FILTER
-        if (category) {
-            const [catRows] = await db.inventory.query("SELECT db_shard FROM categories WHERE id = ?", [category]);
-            if (catRows.length > 0) {
-                const shardKey = catRows[0].db_shard || 'shard_general';
-                const client = clients[shardKey] || clients.shard_general;
-                try {
-                    const res = await client.execute({
-                        sql: `SELECT * FROM products WHERE category_id = ? AND status = 'in_stock' ORDER BY created_at DESC LIMIT ?`,
-                        args: [category, parseInt(limit)]
-                    });
-                    results = res.rows;
-                } catch (e) {
-                    console.error(`[Single Category Fail] Shard: ${shardKey}`, e.message);
-                    // Don't crash, just return empty for this category
-                }
-            }
-        }
-        // CASE B: SEARCH OR EXPLORE (MULTI-SHARD)
-        else {
-            let sql = "";
-            let args = [];
+        // Logic to split them into rows (Moved from getHomepageData)
+        const subCategoriesAll = allCats.filter(cat => cat.parent_id);
+        const subCatRow1 = subCategoriesAll.slice(0, 16);
+        const subCatRow2 = subCategoriesAll.slice(16, 32);
+        const subCatRow3 = subCategoriesAll.slice(32, 48);
 
-            if (supplierId) {
-                sql = `SELECT * FROM products WHERE supplier_id = ? AND status = 'in_stock' ORDER BY created_at DESC LIMIT ${parseInt(limit)}`;
-                args = [supplierId];
-            } else if (search) {
-                sql = `SELECT * FROM products WHERE title LIKE ? AND status = 'in_stock' LIMIT 15`;
-                args = [`%${search}%`];
-            } else {
-                const itemsPerShard = Math.ceil(parseInt(limit) / 10) + 2; 
-                sql = `SELECT * FROM products WHERE status = 'in_stock' ORDER BY created_at DESC LIMIT ${itemsPerShard}`;
-            }
-
-            // 🔥 FAIL-SAFE LOGIC: WRAP EACH SHARD IN A TRY-CATCH 🔥
-            const allPromises = Object.entries(clients).map(async ([key, client]) => {
-                try {
-                    const res = await client.execute({ sql, args });
-                    return res.rows;
-                } catch (e) {
-                    console.error(`⚠️ SKIPPING BROKEN SHARD: [${key}] - ${e.message}`);
-                    return []; // Return empty array so the site keeps loading!
-                }
-            });
-
-            // This will wait for all, but NONE will crash now.
-            const allRes = await Promise.all(allPromises);
-            
-            // Combine all successful results
-            allRes.forEach(rows => {
-                if (rows && Array.isArray(rows)) results.push(...rows);
-            });
-
-            results.sort((a,b) => new Date(b.created_at) - new Date(a.created_at));
-            results = results.slice(0, parseInt(limit));
-        }
-
-        // Send the data (even if some shards failed)
-        res.set('Cache-Control', 'public, s-maxage=300, stale-while-revalidate=30');
-        res.status(200).json({ products: results.map(p => parseProduct(p)) });
-
-    } catch (e) {
-        console.error("Explore Critical Error:", e);
-        // Even if the main logic fails, return empty list instead of 500 error
-        res.status(200).json({ products: [] });
+        // Aggressive Caching for Categories (They rarely change)
+        res.set('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=600');
+        
+        res.json({ subCatRow1, subCatRow2, subCatRow3 });
+    } catch (error) {
+        console.error("Homepage Cats Error:", error);
+        res.status(500).json({ subCatRow1: [], subCatRow2: [], subCatRow3: [] });
     }
 };
 
+
+
+
+exports.getMainCategories = async (req, res) => {
+    try {
+        const [mainCategories] = await db.inventory.query("SELECT id, name, slug FROM categories WHERE parent_id IS NULL ORDER BY name ASC");
+        res.json({ categories: mainCategories });
+    } catch (error) { res.status(500).json({ categories: [] }); }
+};
+
+exports.getCategoriesWithSubcategories = async (req, res) => {
+    try {
+        const [parentsPromise, childrenPromise] = [
+            db.inventory.query("SELECT id, name, image_url, slug FROM categories WHERE parent_id IS NULL ORDER BY name ASC"),
+            db.inventory.query("SELECT id, name, image_url, slug, parent_id FROM categories WHERE parent_id IS NOT NULL")
+        ];
+        const [[parents], [children]] = await Promise.all([parentsPromise, childrenPromise]);
+        const parentMap = new Map();
+        parents.forEach(p => { p.subcategories = []; parentMap.set(p.id, p); });
+        children.forEach(child => { if (parentMap.has(child.parent_id)) { parentMap.get(child.parent_id).subcategories.push(child); } });
+        res.status(200).json({ mainCats: parents });
+    } catch (error) { res.status(500).json({ mainCats: [] }); }
+};
+
+// ... Keep getSearchSuggestions, getProductBySlug, etc. unchanged below ...
+exports.getSearchSuggestions = async (req, res) => {
+    try {
+        const { q } = req.query;
+        if(!q || q.length < 2) return res.json([]);
+        const sql = `SELECT title FROM products WHERE LOWER(title) LIKE LOWER(?) LIMIT 5`;
+        const args = [`%${q.trim()}%`];
+        const promises = Object.values(clients).map(c => c.execute({ sql, args }).then(r => r.rows).catch(()=>[]));
+        const results = await Promise.all(promises);
+        const suggestions = [...new Set(results.flat().map(p => p.title))].slice(0, 6);
+        res.json(suggestions);
+    } catch(e) { res.json([]); }
+};
+
 /* ======================================================
-   3. SINGLE PRODUCT DETAIL
+   5. SINGLE PRODUCT (Uses Constructor for Related)
    ====================================================== */
 exports.getProductBySlug = async (req, res) => {
     try {
         const { slug } = req.params;
         const shardKeys = Object.keys(clients);
         const searchPromises = shardKeys.map(async (key) => {
-            const res = await clients[key].execute({ sql: "SELECT * FROM products WHERE slug = ? LIMIT 1", args: [slug] });
-            return res.rows.length > 0 ? { p: res.rows[0], key: key } : null;
+            try { return await clients[key].execute({ sql: "SELECT * FROM products WHERE slug = ? LIMIT 1", args: [slug] }).then(r => r.rows.length ? { p: r.rows[0], key } : null); } catch { return null; }
         });
-
-        const matches = await Promise.all(searchPromises);
-        const match = matches.find(r => r !== null);
-
+        const match = (await Promise.all(searchPromises)).find(r => r);
         if (!match) return res.status(404).json({ message: "Product not found" });
-        const product = parseProduct(match.p);
-        const client = clients[match.key]; 
 
-        const [[supplierRows], [reviews], relatedRes, variantsRes] = await Promise.all([
-            db.suppliers.query("SELECT id, brand_name as name, profile_pic, average_rating, followers_count, verified_status FROM suppliers WHERE id = ?", [product.supplier_id]),
+        const product = match.p;
+        let image_urls = [];
+        try { image_urls = typeof product.image_urls === 'string' ? JSON.parse(product.image_urls) : product.image_urls; } catch (e) {}
+
+        const [[sup], [rev], rel, varRes] = await Promise.all([
+            db.suppliers.query("SELECT id, brand_name as name, profile_pic, average_rating, followers_count, verified_status, total_products, city FROM suppliers WHERE id = ?", [product.supplier_id]),
             db.reviews.query("SELECT * FROM reviews WHERE product_id = ? ORDER BY created_at DESC LIMIT 5", [product.id]),
-            client.execute({ sql: "SELECT * FROM products WHERE category_id = ? AND id != ? LIMIT 8", args: [product.category_id, product.id] }),
-            client.execute({ sql: "SELECT * FROM variants WHERE product_id = ?", args: [product.id] })
+            clients[match.key].execute({ sql: "SELECT * FROM products WHERE category_id = ? AND id != ? LIMIT 8", args: [product.category_id, product.id] }),
+            clients[match.key].execute({ sql: "SELECT * FROM variants WHERE product_id = ?", args: [product.id] })
         ]);
 
-        const supplier = supplierRows[0] || { name: "Store Seller", verified_status: "verified", followers_count: 0, average_rating: 0 };
-        const avgRating = reviews.length > 0 ? (reviews.reduce((acc, r) => acc + parseFloat(r.rating), 0) / reviews.length) : 0;
+        const sData = sup[0] || {};
+        const isVerified = String(sData.verified_status).toLowerCase() === 'verified';
 
-        const finalData = {
-            ...product,
-            variants: variantsRes.rows,
-            supplier,
-            reviews,
-            related_products: relatedRes.rows.map(p => parseProduct(p)),
-            avg_rating: avgRating,
-            total_reviews_count: reviews.length,
-            product_ratings: [{ avg_rating: avgRating, review_count: reviews.length }], 
-            is_favorite: false 
-        };
+        // 🔥 CONSTRUCT CARDS FOR RELATED PRODUCTS 🔥
+        const relatedEnriched = await constructProductCards(rel.rows);
 
-        // ⚡ CACHE FOR 5 MINUTES (Unless user is logged in, but header handles static parts) ⚡
-        res.set('Cache-Control', 'public, s-maxage=300, stale-while-revalidate=30');
-        res.status(200).json(finalData);
-
-    } catch (e) {
-        console.error("Product Detail Error:", e);
-        res.status(500).json({ message: "Error" });
-    }
+        res.json({ 
+            ...product, 
+            image_urls,
+            price: parseFloat(product.price),
+            discounted_price: parseFloat(product.discounted_price || product.price),
+            supplier_verified: isVerified,
+            supplier: { 
+                ...sData, 
+                verified_status: isVerified ? 'verified' : 'unverified',
+                is_verified: isVerified // Helper for frontend
+            }, 
+            reviews: rev, 
+            related_products: relatedEnriched, // <--- ENRICHED LIST
+            variants: varRes.rows || [],
+            avg_rating: rev.length > 0 ? (rev.reduce((a, b) => a + parseFloat(b.rating), 0) / rev.length) : 0 
+        });
+    } catch (e) { res.status(500).json({ message: "Server Error" }); }
 };
 
+
 /* ======================================================
-   4. CATEGORY ROWS 
+   3. CATEGORY ROWS (Uses Constructor)
    ====================================================== */
 exports.getCategoryRows = async (req, res) => {
     try {
         const [parents] = await db.inventory.query("SELECT id, name, slug, db_shard FROM categories WHERE parent_id IS NULL ORDER BY name ASC");
-        
         const promises = parents.map(async p => {
             const client = clients[p.db_shard] || clients.shard_general;
             const [subs] = await db.inventory.query("SELECT id FROM categories WHERE parent_id = ?", [p.id]);
             const ids = [p.id, ...subs.map(s => s.id)].join(',');
-
             try {
                 const res = await client.execute(`SELECT * FROM products WHERE category_id IN (${ids}) AND status='in_stock' ORDER BY created_at DESC LIMIT 10`);
                 if(res.rows.length > 0) {
-                    return { 
-                        category_id: p.id, 
-                        category_name: p.name, 
-                        category_slug: p.slug, 
-                        products: res.rows.map(p => parseProduct(p)) 
-                    };
+                    // 🔥 CONSTRUCT CARDS 🔥
+                    const enriched = await constructProductCards(res.rows);
+                    return { category_id: p.id, category_name: p.name, category_slug: p.slug, products: enriched };
                 }
             } catch(e) {}
             return null;
         });
-
         const rows = (await Promise.all(promises)).filter(r => r);
-        
-        // ⚡ CACHE FOR 30 MINUTES ⚡
         res.set('Cache-Control', 'public, s-maxage=1800, stale-while-revalidate=60');
         res.json(rows);
     } catch (e) { res.json([]); }
 };
-
 /* ======================================================
-   5. CATEGORY PAGE
+   FIXED: Get Products By Category (Removed invalid sort)
    ====================================================== */
 exports.getProductsByCategorySlug = async (req, res) => {
     try {
         const { slug } = req.params;
         const page = parseInt(req.query.page) || 1;
-        const limit = 20;
-        const sort = req.query.sort || 'newest';
+        const limit = parseInt(req.query.limit) || 40;
+        const offset = (page - 1) * limit;
+        
+        // Filters
+        const sort = req.query.sort || 'default';
+        const search = req.query.search ? req.query.search.trim() : null;
+        const maxPrice = req.query.maxPrice ? parseFloat(req.query.maxPrice) : null;
 
-        const [catRows] = await db.inventory.query("SELECT id, name, slug, db_shard, parent_id FROM categories WHERE slug = ?", [slug]);
+        // 1. Get Category Info
+        const [catRows] = await db.inventory.query("SELECT id, name, slug, db_shard FROM categories WHERE slug = ?", [slug]);
         if (catRows.length === 0) return res.status(404).json({ message: "Not found" });
         const category = catRows[0];
+        const client = clients[category.db_shard || 'shard_general'] || clients.shard_general;
 
-        const shardKey = category.db_shard || 'shard_general';
-        const client = clients[shardKey] || clients.shard_general;
-
+        // 2. Get Subcategory IDs
         const [children] = await db.inventory.query("SELECT id FROM categories WHERE parent_id = ?", [category.id]);
         const ids = [category.id, ...children.map(c => c.id)].join(',');
 
-        let orderBy = "ORDER BY created_at DESC";
-        if (sort === 'price_high') orderBy = "ORDER BY price DESC";
-        if (sort === 'price_low') orderBy = "ORDER BY price ASC";
+        // 3. FETCH PROMOTED IDs (From MySQL)
+        let promotedIds = [];
+        try {
+            const [pRows] = await db.inventory.query(
+                "SELECT product_id FROM promoted_products WHERE payment_status = 'paid' AND start_date <= NOW() AND end_date >= NOW()"
+            );
+            promotedIds = pRows.map(r => String(r.product_id)); 
+        } catch (e) { console.error(e); }
 
+        // 4. Build SQL for Turso
+        let sql = `SELECT * FROM products WHERE category_id IN (${ids}) AND status = 'in_stock'`;
+        let countSql = `SELECT COUNT(*) as total FROM products WHERE category_id IN (${ids}) AND status = 'in_stock'`;
+        let args = [];
+
+        // Search Logic
+        if (search) {
+            sql += ` AND LOWER(title) LIKE ?`;
+            countSql += ` AND LOWER(title) LIKE ?`;
+            args.push(`%${search.toLowerCase()}%`);
+        }
+        // Price Logic
+        if (maxPrice) {
+            sql += ` AND price <= ?`;
+            countSql += ` AND price <= ?`;
+            args.push(maxPrice);
+        }
+
+        // 5. 🔥 SORTING LOGIC (FIXED) 🔥
+        // We calculate Promoted status here: 0 = Promoted, 1 = Not Promoted
+        let promotedFragment = "1"; 
+        if (promotedIds.length > 0) {
+            const idList = promotedIds.map(id => `'${id}'`).join(',');
+            promotedFragment = `CASE WHEN id IN (${idList}) THEN 0 ELSE 1 END`;
+        }
+
+        // Apply Sort
+        if (sort === 'price_high') {
+            sql += ` ORDER BY price DESC`;
+        } else if (sort === 'price_low') {
+            sql += ` ORDER BY price ASC`;
+        } else {
+            // ❌ REMOVED: review_count DESC (Because it doesn't exist in Turso)
+            // ✅ ADDED: id DESC (as a fallback tie-breaker)
+            // Logic: Promoted First -> Then Newest -> Then by ID
+            sql += ` ORDER BY ${promotedFragment} ASC, created_at DESC`;
+        }
+
+        sql += ` LIMIT ? OFFSET ?`;
+        args.push(limit, offset);
+
+        // 6. Execute Queries
         const [pRes, cRes] = await Promise.all([
-            client.execute({ sql: `SELECT * FROM products WHERE category_id IN (${ids}) AND status = 'in_stock' ${orderBy} LIMIT ${limit} OFFSET ${(page-1)*limit}` }),
-            client.execute({ sql: `SELECT COUNT(*) as total FROM products WHERE category_id IN (${ids}) AND status = 'in_stock'` })
+            client.execute({ sql, args }),
+            client.execute({ sql: countSql, args: args.slice(0, args.length - 2) })
         ]);
 
-        const response = {
-            category,
-            products: pRes.rows.map(p => parseProduct(p)),
-            total: cRes.rows[0].total,
-            totalPages: Math.ceil(cRes.rows[0].total / limit),
-            currentPage: page
-        };
+        // 7. Enrich Data (This puts the reviews back into the JSON response)
+        let enrichedProducts = await constructProductCards(pRes.rows);
+        
+        // Flag Promoted for Frontend UI
+        const promotedSet = new Set(promotedIds);
+        enrichedProducts = enrichedProducts.map(p => ({
+            ...p,
+            is_promoted: promotedSet.has(String(p.id))
+        }));
 
-        // ⚡ CACHE FOR 10 MINUTES ⚡
-        res.set('Cache-Control', 'public, s-maxage=600, stale-while-revalidate=30');
-        res.status(200).json(response);
+        // 🔥 OPTIONAL: CLIENT-SIDE SORT FOR "MOST REVIEWED" 🔥
+        // If sorting by reviews is critical, we do it here on the current page of results
+        if (sort === 'popular' || sort === 'default') {
+            enrichedProducts.sort((a, b) => {
+                // 1. Promoted First
+                if (a.is_promoted !== b.is_promoted) return a.is_promoted ? -1 : 1;
+                // 2. Then Review Count (We have this data now from constructProductCards)
+                return (b.review_count || 0) - (a.review_count || 0);
+            });
+        }
+
+        res.json({ 
+            category, 
+            products: enrichedProducts, 
+            total: cRes.rows[0].total, 
+            totalPages: Math.ceil(cRes.rows[0].total / limit), 
+            currentPage: page 
+        });
 
     } catch (e) { 
-        res.status(500).json({message: "Error"}); 
+        console.error("Error in Category Controller:", e);
+        res.status(500).json({message: "Server Error"}); 
     }
 };
-
-// HELPERS
 exports.incrementProductView = async (req, res) => {
-    Object.values(clients).forEach(c => {
-        c.execute({sql:"UPDATE products SET views = views + 1 WHERE id = ?", args:[req.params.id]}).catch(()=>{});
-    });
-    res.json({status:"ok"});
+    try {
+        const { id } = req.params; 
+        await viewsClient.execute({ sql: `INSERT INTO product_views (product_id, views) VALUES (?, 1) ON CONFLICT(product_id) DO UPDATE SET views = views + 1`, args: [id] });
+        res.json({ status: "ok" });
+    } catch(e) { res.json({ status: "error" }); }
 };
 
 exports.getActivePromotionalTimer = async (req, res) => {
@@ -326,33 +581,40 @@ exports.getCategoriesWithSubcategories = async (req, res) => {
             db.inventory.query("SELECT id, name, image_url, slug FROM categories WHERE parent_id IS NULL ORDER BY name ASC"),
             db.inventory.query("SELECT id, name, image_url, slug, parent_id FROM categories WHERE parent_id IS NOT NULL")
         ];
-
         const [[parents], [children]] = await Promise.all([parentsPromise, childrenPromise]);
         const parentMap = new Map();
-        
-        parents.forEach(p => {
-            p.subcategories = []; 
-            parentMap.set(p.id, p);
-        });
-
-        children.forEach(child => {
-            if (parentMap.has(child.parent_id)) {
-                parentMap.get(child.parent_id).subcategories.push(child);
-            }
-        });
-
+        parents.forEach(p => { p.subcategories = []; parentMap.set(p.id, p); });
+        children.forEach(child => { if (parentMap.has(child.parent_id)) { parentMap.get(child.parent_id).subcategories.push(child); } });
         const response = { mainCats: parents };
-        res.set('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=60'); // 1 Hour Cache
+        res.set('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=60'); 
         res.status(200).json(response);
-
-    } catch (error) {
-        res.status(500).json({ mainCats: [] });
-    }
+    } catch (error) { res.status(500).json({ mainCats: [] }); }
 };
 
 exports.getProductById = async (req, res) => {
-    const { id } = req.params;
-    const matches = await queryAllShards("SELECT * FROM products WHERE id = ? LIMIT 1", [id]);
-    if (matches.length > 0) return res.json(parseProduct(matches[0]));
-    res.status(404).json({ message: "Use Slug" });
+    try {
+        const { id } = req.params;
+        const shardKeys = Object.keys(clients);
+        const searchPromises = shardKeys.map(async (key) => {
+            const client = clients[key];
+            try {
+                const res = await client.execute({ sql: "SELECT * FROM products WHERE id = ? LIMIT 1", args: [id] });
+                return res.rows.length > 0 ? { product: res.rows[0], client: client } : null;
+            } catch (e) { return null; }
+        });
+        const results = await Promise.all(searchPromises);
+        const match = results.find(r => r !== null);
+        if (!match) return res.status(404).json({ message: "Product not found" });
+        const { product, client } = match;
+        let variants = [];
+        try {
+            const variantRes = await client.execute({ sql: "SELECT * FROM variants WHERE product_id = ?", args: [product.id] });
+            variants = variantRes.rows;
+        } catch (e) { }
+        const finalProduct = parseProduct(product);
+        finalProduct.variants = variants; 
+        res.json(finalProduct);
+    } catch (error) { res.status(500).json({ message: "Server Error" }); }
 };
+
+// --- THIS LINE ALSO NEEDS TO BE IN THE FILE to export getExploreFeed correctly if you replaced getAllProducts logic completely

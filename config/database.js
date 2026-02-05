@@ -38,7 +38,8 @@ const pools = {
     inventory: createPool(process.env.DB_INVENTORY_URL),
     suppliers: createPool(process.env.DB_SUPPLIERS_URL),
     reviews: createPool(process.env.DB_REVIEWS_URL),
-    db_social: createPool(process.env.DB_SOCIAL_URL)
+    db_social: createPool(process.env.DB_SOCIAL_URL),
+    users: createPool(process.env.DB_USERS_URL) // 👈 ADDED THIS LINE
 };
 
 module.exports = pools;

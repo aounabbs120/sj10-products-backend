@@ -7,7 +7,8 @@ const compression = require('compression');
 const productRoutes = require('../routes/productRoutes');
 const supplierRoutes = require('../routes/supplierRoutes');
 const socialRoutes = require('../routes/socialRoutes');
-
+const uploadRoutes = require('../routes/uploadRoutes'); // <--- ADD THIS
+const internalRoutes = require('../routes/internalRoutes'); // 👈 IMPORT THIS
 const app = express();
 
 // Middleware
@@ -19,6 +20,8 @@ app.use(compression()); // Gzip compression for speed
 app.use('/api/products', productRoutes);
 app.use('/api/suppliers', supplierRoutes);
 app.use('/api/social', socialRoutes);
+app.use('/api/upload', uploadRoutes); // <--- ADD THIS
+app.use('/api/internal', internalRoutes); // 👈 MOUNT THIS
 
 // Health Check
 app.get('/', (req, res) => {
