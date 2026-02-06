@@ -420,29 +420,71 @@ exports.getProductBySlug = async (req, res) => {
 
 
 /* ======================================================
-   3. CATEGORY ROWS (Uses Constructor)
+   3. CATEGORY ROWS (OPTIMIZED & FIXED)
    ====================================================== */
 exports.getCategoryRows = async (req, res) => {
     try {
-        const [parents] = await db.inventory.query("SELECT id, name, slug, db_shard FROM categories WHERE parent_id IS NULL ORDER BY name ASC");
+        // 1. Fetch ALL categories (Parents & Children) in ONE single query
+        const [allCats] = await db.inventory.query(
+            "SELECT id, name, slug, db_shard, parent_id FROM categories ORDER BY name ASC"
+        );
+
+        // 2. Separate Parents and Children in Memory
+        // FIXED TYPO HERE: changed 'cB' to 'c'
+        const parents = allCats.filter(c => !c.parent_id);
+        const children = allCats.filter(c => c.parent_id); 
+
+        // 3. Create a Map for fast lookup of subcategories
+        const childMap = new Map();
+        children.forEach(c => {
+            if (!childMap.has(c.parent_id)) childMap.set(c.parent_id, []);
+            childMap.get(c.parent_id).push(c.id);
+        });
+
+        // 4. Parallel execution for products
         const promises = parents.map(async p => {
             const client = clients[p.db_shard] || clients.shard_general;
-            const [subs] = await db.inventory.query("SELECT id FROM categories WHERE parent_id = ?", [p.id]);
-            const ids = [p.id, ...subs.map(s => s.id)].join(',');
+            
+            // Get subcategory IDs from our memory map
+            const subIds = childMap.get(p.id) || [];
+            const ids = [p.id, ...subIds].join(',');
+
             try {
-                const res = await client.execute(`SELECT * FROM products WHERE category_id IN (${ids}) AND status='in_stock' ORDER BY created_at DESC LIMIT 10`);
+                // Select only specific columns to reduce data transfer size
+                const sql = `
+                    SELECT id, title, slug, price, discounted_price, 
+                           image_urls, video_url, supplier_id, created_at, 
+                           category_id, views 
+                    FROM products 
+                    WHERE category_id IN (${ids}) 
+                    AND status='in_stock' 
+                    ORDER BY created_at DESC 
+                    LIMIT 10
+                `;
+                
+                const res = await client.execute(sql);
+                
                 if(res.rows.length > 0) {
-                    // 🔥 CONSTRUCT CARDS 🔥
+                    // Enrich with Supplier Badges & Ratings
                     const enriched = await constructProductCards(res.rows);
                     return { category_id: p.id, category_name: p.name, category_slug: p.slug, products: enriched };
                 }
-            } catch(e) {}
+            } catch(e) {
+                console.error(`Error fetching rows for cat ${p.id}`, e.message);
+            }
             return null;
         });
+
         const rows = (await Promise.all(promises)).filter(r => r);
+
+        // Set Aggressive Caching
         res.set('Cache-Control', 'public, s-maxage=1800, stale-while-revalidate=60');
         res.json(rows);
-    } catch (e) { res.json([]); }
+
+    } catch (e) { 
+        console.error("CategoryRows Error:", e);
+        res.json([]); 
+    }
 };
 /* ======================================================
    FIXED: Get Products By Category (Removed invalid sort)
