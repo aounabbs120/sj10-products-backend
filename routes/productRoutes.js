@@ -13,6 +13,8 @@ router.get('/active-timer', productController.getActivePromotionalTimer);
 // --- EXPLORE FEED (Dedicated Endpoint) ---
 // ✅ FIX: This is the route for your infinite scroll section.
 router.get('/explore-feed', productController.getExploreFeed);
+router.get('/search-results', productController.getSearchResults); // For the results page
+router.get('/suggestions-text', productController.getSearchSuggestionsText); // ✅ THIS LINE IS CRITICAL
 
 router.get('/homepage-categories', productController.getHomepageCategories);
 // --- OTHER PRODUCT ROUTES ---
@@ -26,6 +28,7 @@ router.post('/:id/view', productController.incrementProductView);
 router.get('/:productId/reviews', reviewController.getProductReviews);
 router.post('/:productId/reviews', authenticateUser, reviewController.createReview);
 router.get('/reviews/mine', authenticateUser, reviewController.getUserReviews);
+
 
 // Note: The generic '/' route is now handled by the explore feed,
 // so it is removed to avoid conflict.

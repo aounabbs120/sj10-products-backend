@@ -189,6 +189,109 @@ const constructProductCards = async (rawProducts) => {
         return rawProducts.map(p => parseProduct(p));
     }
 };
+
+// ... existing getExploreFeed code ...
+
+/* ======================================================
+   NEW: DEDICATED SEARCH RESULTS (Promoted First)
+   ====================================================== */
+exports.getSearchResults = async (req, res) => {
+    try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 30;
+        const offset = (page - 1) * limit;
+        const { q } = req.query; // Search term
+
+        if (!q) return res.json({ products: [], totalCount: 0 });
+
+        // 1. Fetch Promoted IDs
+        let promotedIds = [];
+        try {
+            const [pRows] = await db.inventory.query(
+                "SELECT product_id FROM promoted_products WHERE payment_status = 'paid' AND start_date <= NOW() AND end_date >= NOW()"
+            );
+            promotedIds = pRows.map(r => r.product_id);
+        } catch (e) {}
+
+        // 2. Search Query
+        const term = `%${q.trim().toLowerCase()}%`;
+        const sql = `SELECT * FROM products WHERE status = 'in_stock' AND LOWER(title) LIKE ?`;
+        const args = [term];
+
+        // 3. Execute across shards
+        const clientValues = Object.values(clients).filter(Boolean);
+        const promises = clientValues.map(async (client) => {
+            try {
+                const res = await client.execute({ sql, args });
+                return res.rows;
+            } catch (e) { return []; }
+        });
+
+        const results = await Promise.all(promises);
+        let allProducts = results.flat();
+
+        // 4. 🔥 SORTING MAGIC: Promoted First 🔥
+        const promotedSet = new Set(promotedIds.map(String)); // String for safe comparison
+
+        allProducts.sort((a, b) => {
+            const isAPromoted = promotedSet.has(String(a.id));
+            const isBPromoted = promotedSet.has(String(b.id));
+
+            // Logic: Promoted comes before Non-Promoted
+            if (isAPromoted && !isBPromoted) return -1;
+            if (!isAPromoted && isBPromoted) return 1;
+            
+            // Tie-breaker: Newest First
+            return new Date(b.created_at) - new Date(a.created_at);
+        });
+
+        // 5. Pagination (In-Memory)
+        const totalCount = allProducts.length;
+        const paginatedProducts = allProducts.slice(offset, offset + limit);
+
+        // 6. Enrich Data (Images/Badges)
+        const finalProducts = await constructProductCards(paginatedProducts);
+
+        // 7. Add 'is_promoted' flag for UI
+        const finalWithFlag = finalProducts.map(p => ({
+            ...p,
+            is_promoted: promotedSet.has(String(p.id))
+        }));
+
+        res.json({ products: finalWithFlag, totalCount });
+
+    } catch (e) {
+        console.error("Search Error:", e);
+        res.status(500).json({ products: [], totalCount: 0 });
+    }
+};
+/* ======================================================
+   NEW: TEXT-ONLY SUGGESTIONS (Super Fast)
+   ====================================================== */
+// ✅ THIS FUNCTION MUST EXIST AND BE EXPORTED
+exports.getSearchSuggestionsText = async (req, res) => {
+    try {
+        const { q } = req.query;
+        if(!q || q.length < 2) return res.json([]);
+
+        // Only select ID, title, and slug to make it lightweight
+        const sql = `SELECT id, title, slug FROM products WHERE status='in_stock' AND LOWER(title) LIKE ? LIMIT 3`;
+        const args = [`%${q.trim().toLowerCase()}%`];
+
+        const promises = Object.values(clients).map(c => 
+            c.execute({ sql, args }).then(r => r.rows).catch(()=>[])
+        );
+
+        const results = await Promise.all(promises);
+        // Flatten results from all shards and limit to 6 total suggestions
+        const suggestions = results.flat().slice(0, 6);
+
+        res.json(suggestions);
+    } catch(e) { 
+        console.error("Suggestions-Text Error:", e);
+        res.json([]); 
+    }
+};
 exports.getExploreFeed = async (req, res) => {
     try {
         const page = parseInt(req.query.page) || 1;
