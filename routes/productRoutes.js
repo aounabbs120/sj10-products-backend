@@ -9,29 +9,30 @@ router.get('/homepage-data', productController.getHomepageData);
 router.get('/category-rows', productController.getCategoryRows);
 router.get('/categories-with-subcategories', productController.getCategoriesWithSubcategories);
 router.get('/active-timer', productController.getActivePromotionalTimer);
-
-// --- EXPLORE FEED (Dedicated Endpoint) ---
-// ✅ FIX: This is the route for your infinite scroll section.
-router.get('/explore-feed', productController.getExploreFeed);
-router.get('/search-results', productController.getSearchResults); // For the results page
-router.get('/suggestions-text', productController.getSearchSuggestionsText); // ✅ THIS LINE IS CRITICAL
-
 router.get('/homepage-categories', productController.getHomepageCategories);
-// --- OTHER PRODUCT ROUTES ---
-router.get('/category/:slug', productController.getProductsByCategorySlug);
-router.get('/slug/:slug', productController.getProductBySlug);
+
+// --- EXPLORE & SEARCH ---
+router.get('/explore-feed', productController.getExploreFeed);
+router.get('/search-results', productController.getSearchResults);
+router.get('/suggestions-text', productController.getSearchSuggestionsText);
 router.get('/suggestions', productController.getSearchSuggestions);
-router.get('/:id', productController.getProductById);
+
+// --- CATEGORY ---
+router.get('/category/:slug', productController.getProductsByCategorySlug);
+
+// --- SINGLE PRODUCT ROUTES (THE FIX) ---
+
+// 1. Matches: /api/products/slug/bike-cover--12
+router.get('/slug/:slug', productController.getProductBySlug);
+
+// 2. Matches: /api/products/bike-cover--12  (Fallback if frontend omits /slug/)
+// 🔥 CHANGE: Point this to getProductBySlug too! It is smart enough to handle IDs or Slugs.
+router.get('/:id', productController.getProductBySlug); 
 
 // --- ACTIONS ---
 router.post('/:id/view', productController.incrementProductView);
 router.get('/:productId/reviews', reviewController.getProductReviews);
 router.post('/:productId/reviews', authenticateUser, reviewController.createReview);
 router.get('/reviews/mine', authenticateUser, reviewController.getUserReviews);
-
-
-// Note: The generic '/' route is now handled by the explore feed,
-// so it is removed to avoid conflict.
-// router.get('/', productController.getAllProducts); // This can be removed or pointed to getExploreFeed
 
 module.exports = router;
