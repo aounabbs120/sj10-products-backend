@@ -473,43 +473,19 @@ exports.getSearchSuggestions = async (req, res) => {
 };
 
 /* ======================================================
-   🔥 FIXED SINGLE PRODUCT LOOKUP (Handles SEO URLs) 🔥
+   5. SINGLE PRODUCT (Uses Constructor for Related)
    ====================================================== */
 exports.getProductBySlug = async (req, res) => {
     try {
-        // 1. Decode Slug (Handle %20, special chars)
-        let { slug } = req.params;
-        slug = decodeURIComponent(slug).trim();
-
-        // 2. Prepare SQL that handles "Exact Match" OR "Slug + SKU" match
-        //    Logic: If URL is "iphone-13-pro-max-A123", it matches DB slug "iphone-13-pro-max"
-        //    We check: Does the REQUESTED slug START with the DB slug?
-        const sql = `
-            SELECT * FROM products 
-            WHERE slug = ? 
-            OR ? LIKE slug || '-%' 
-            LIMIT 1
-        `;
-
+        const { slug } = req.params;
         const shardKeys = Object.keys(clients);
         const searchPromises = shardKeys.map(async (key) => {
-            try { 
-                // Pass 'slug' twice: once for exact match, once for LIKE match
-                return await clients[key].execute({ sql, args: [slug, slug] })
-                    .then(r => r.rows.length ? { p: r.rows[0], key } : null); 
-            } catch { return null; }
+            try { return await clients[key].execute({ sql: "SELECT * FROM products WHERE slug = ? LIMIT 1", args: [slug] }).then(r => r.rows.length ? { p: r.rows[0], key } : null); } catch { return null; }
         });
-
         const match = (await Promise.all(searchPromises)).find(r => r);
-
-        if (!match) {
-            console.log(`Product 404: ${slug}`);
-            return res.status(404).json({ message: "Product not found" });
-        }
+        if (!match) return res.status(404).json({ message: "Product not found" });
 
         const product = match.p;
-
-        // 3. Parse and Fetch Related Data
         let image_urls = [];
         try { image_urls = typeof product.image_urls === 'string' ? JSON.parse(product.image_urls) : product.image_urls; } catch (e) {}
 
@@ -523,7 +499,7 @@ exports.getProductBySlug = async (req, res) => {
         const sData = sup[0] || {};
         const isVerified = String(sData.verified_status).toLowerCase() === 'verified';
 
-        // Use Constructor for Related Products (Adds badges, ratings, etc.)
+        // 🔥 CONSTRUCT CARDS FOR RELATED PRODUCTS 🔥
         const relatedEnriched = await constructProductCards(rel.rows);
 
         res.json({ 
@@ -535,18 +511,14 @@ exports.getProductBySlug = async (req, res) => {
             supplier: { 
                 ...sData, 
                 verified_status: isVerified ? 'verified' : 'unverified',
-                is_verified: isVerified
+                is_verified: isVerified // Helper for frontend
             }, 
             reviews: rev, 
-            related_products: relatedEnriched,
+            related_products: relatedEnriched, // <--- ENRICHED LIST
             variants: varRes.rows || [],
             avg_rating: rev.length > 0 ? (rev.reduce((a, b) => a + parseFloat(b.rating), 0) / rev.length) : 0 
         });
-
-    } catch (e) { 
-        console.error("GetProduct Error:", e);
-        res.status(500).json({ message: "Server Error" }); 
-    }
+    } catch (e) { res.status(500).json({ message: "Server Error" }); }
 };
 
 
