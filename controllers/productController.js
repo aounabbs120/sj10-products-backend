@@ -472,14 +472,15 @@ exports.getSearchSuggestions = async (req, res) => {
     } catch(e) { res.json([]); }
 };
 
+// api/controllers/productController.js
+
+// ... (Keep existing imports: clients, viewsClient, db, etc.)
+
 /* ======================================================
-   🔥 FIXED: SMART PEEL STRATEGY (Handles SKUs with hyphens) 🔥
+   🔥 FIXED: SMART PEEL STRATEGY & ENRICHED DATA 🔥
    ====================================================== */
 exports.getProductBySlug = async (req, res) => {
     try {
-        // 1. LOGGING
-        console.log("🔍 Incoming Request Params:", req.params);
-
         let rawParam = req.params.slug || req.params.id;
         if (!rawParam || rawParam === 'undefined') {
             return res.status(400).json({ message: "Invalid Product Identifier" });
@@ -489,118 +490,97 @@ exports.getProductBySlug = async (req, res) => {
         const shardKeys = Object.keys(clients);
         const lookupOps = [];
 
-        // --- STEP 1: PREPARE CANDIDATES ---
+        // ... (Keep existing SKU/Slug peeling logic here) ...
         const candidates = new Set();
-        candidates.add(decodedParam); // 1. Try exact match (e.g. just the slug)
-
-        // 2. Try ID Match (Pattern: ends with "--12")
+        candidates.add(decodedParam);
         const idMatch = decodedParam.match(/--(\d+)$/);
         const extractedId = idMatch ? idMatch[1] : null;
-
-        // 3. Try "Smart Peel" for Slug detection
-        // If URL is "my-product-slug-SJ10-180646"
-        // It tries:
-        // A. "my-product-slug-SJ10-180646" (Slug match)
-        // B. "my-product-slug-SJ10"        (Assuming '180646' is SKU)
-        // C. "my-product-slug"             (Assuming 'SJ10-180646' is SKU)
-        
         const parts = decodedParam.split('-');
         if (parts.length > 1) {
-            // Peel off the last part
             candidates.add(parts.slice(0, -1).join('-')); 
-            // Peel off the last 2 parts (Common for SKUs like 'SJ10-123')
-            if (parts.length > 2) {
-                candidates.add(parts.slice(0, -2).join('-'));
-            }
+            if (parts.length > 2) candidates.add(parts.slice(0, -2).join('-'));
         }
 
-        // --- STEP 2: BUILD PARALLEL QUERIES ---
         shardKeys.forEach(key => {
             const client = clients[key];
-
-            // A. Search by ID (Highest Priority)
             if (extractedId) {
-                lookupOps.push(
-                    client.execute({ sql: "SELECT * FROM products WHERE id = ? LIMIT 1", args: [extractedId] })
-                        .then(r => r.rows.length ? { p: r.rows[0], key } : null)
-                        .catch(() => null)
-                );
+                lookupOps.push(client.execute({ sql: "SELECT * FROM products WHERE id = ? LIMIT 1", args: [extractedId] }).then(r => r.rows.length ? { p: r.rows[0], key } : null).catch(() => null));
             }
-
-            // B. Search for ALL Slug Candidates in parallel
             candidates.forEach(slugCandidate => {
-                lookupOps.push(
-                    client.execute({ sql: "SELECT * FROM products WHERE slug = ? LIMIT 1", args: [slugCandidate] })
-                        .then(r => r.rows.length ? { p: r.rows[0], key } : null)
-                        .catch(() => null)
-                );
+                lookupOps.push(client.execute({ sql: "SELECT * FROM products WHERE slug = ? LIMIT 1", args: [slugCandidate] }).then(r => r.rows.length ? { p: r.rows[0], key } : null).catch(() => null));
             });
-
-            // C. Search by Exact SKU (using full param just in case)
-            // Or try the suffix strategy for SKU
-            const potentialSku = parts[parts.length - 1]; // Try simple suffix
+            // Try SKU match
+            const potentialSku = parts[parts.length - 1];
             if (potentialSku) {
-                lookupOps.push(
-                    client.execute({ sql: "SELECT * FROM products WHERE sku = ? LIMIT 1", args: [potentialSku] })
-                        .then(r => r.rows.length ? { p: r.rows[0], key } : null)
-                        .catch(() => null)
-                );
+                lookupOps.push(client.execute({ sql: "SELECT * FROM products WHERE sku = ? LIMIT 1", args: [potentialSku] }).then(r => r.rows.length ? { p: r.rows[0], key } : null).catch(() => null));
             }
         });
 
-        // --- STEP 3: EXECUTE & SELECT BEST MATCH ---
         const results = await Promise.all(lookupOps);
         
-        // Priority: 
-        // 1. ID Match
-        // 2. Slug Match (Longest matching slug wins to avoid partial matches)
-        // 3. SKU Match
-        
         let match = null;
-
-        if (extractedId) {
-            match = results.find(r => r && String(r.p.id) === String(extractedId));
-        }
-
+        if (extractedId) match = results.find(r => r && String(r.p.id) === String(extractedId));
         if (!match) {
-            // Sort matches by slug length descending (so "my-product" doesn't match "my-product-2")
             const validMatches = results.filter(r => r);
-            
-            // Find one where the DB slug matches one of our candidates
             match = validMatches.find(r => candidates.has(r.p.slug));
-            
-            // Fallback: SKU match
             if (!match) match = validMatches[0];
         }
 
-        if (!match) {
-            console.log(`❌ Product Not Found in DB: ${decodedParam}`);
-            return res.status(404).json({ message: "Product not found" });
-        }
+        if (!match) return res.status(404).json({ message: "Product not found" });
 
         const product = match.p;
 
-        // --- STEP 4: FETCH RELATED DATA ---
-        let image_urls = [];
-        try { image_urls = typeof product.image_urls === 'string' ? JSON.parse(product.image_urls) : product.image_urls; } catch (e) {}
-
-        const [[sup], [rev], rel, varRes] = await Promise.all([
+        // --- NEW: FETCH EXTRA STATS & BADGES ---
+        const [
+            [sup], 
+            [rev], 
+            rel, 
+            varRes,
+            [favCount], // Favorites Count
+            [promoted], // Promoted Status
+            [discount]  // Dynamic Discount
+        ] = await Promise.all([
             db.suppliers.query("SELECT id, brand_name as name, profile_pic, average_rating, followers_count, verified_status, total_products, city FROM suppliers WHERE id = ?", [product.supplier_id]),
             db.reviews.query("SELECT * FROM reviews WHERE product_id = ? ORDER BY created_at DESC LIMIT 5", [product.id]),
-            clients[match.key].execute({ sql: "SELECT * FROM products WHERE category_id = ? AND id != ? LIMIT 8", args: [product.category_id, product.id] }),
-            clients[match.key].execute({ sql: "SELECT * FROM variants WHERE product_id = ?", args: [product.id] })
+            clients[match.key].execute({ sql: "SELECT * FROM products WHERE category_id = ? AND id != ? LIMIT 15", args: [product.category_id, product.id] }),
+            clients[match.key].execute({ sql: "SELECT * FROM variants WHERE product_id = ?", args: [product.id] }),
+            // 1. Favorites Count
+            db.db_social.query("SELECT COUNT(*) as count FROM product_favorites WHERE product_id = ?", [product.id]),
+            // 2. Promoted Status
+            db.inventory.query("SELECT id FROM promoted_products WHERE product_id = ? AND payment_status = 'paid' AND start_date <= NOW() AND end_date >= NOW() LIMIT 1", [product.id]),
+            // 3. Discount Label
+            db.inventory.query("SELECT d.name FROM discount_products dp JOIN discounts d ON dp.discount_id = d.id WHERE dp.product_id = ? AND d.is_active = 1 LIMIT 1", [product.id])
         ]);
+
+        // Get View Count from Views DB
+        let viewCount = 0;
+        try {
+            const vRes = await viewsClient.execute({ sql: "SELECT views FROM product_views WHERE product_id = ?", args: [product.id] });
+            viewCount = vRes.rows[0]?.views || 0;
+        } catch(e) {}
 
         const sData = sup[0] || {};
         const isVerified = ['verified', 'true', '1'].includes(String(sData.verified_status).toLowerCase());
 
-        const relatedEnriched = await constructProductCards(rel.rows);
+        // Construct Response
+        let image_urls = [];
+        try { image_urls = typeof product.image_urls === 'string' ? JSON.parse(product.image_urls) : product.image_urls; } catch (e) {}
+
+        // Enrich Related Products
+        const relatedEnriched = await constructProductCards(rel.rows); // Ensure this function exists in your controller (from previous code)
 
         res.json({ 
             ...product, 
             image_urls,
             price: parseFloat(product.price),
             discounted_price: parseFloat(product.discounted_price || product.price),
+            
+            // New Fields
+            views: viewCount,
+            favorites_count: favCount[0]?.count || 0,
+            is_promoted: promoted.length > 0,
+            discount_label: discount.length > 0 ? discount[0].name : null,
+            
             supplier_verified: isVerified,
             supplier: { 
                 ...sData, 
@@ -619,6 +599,7 @@ exports.getProductBySlug = async (req, res) => {
     }
 };
 
+// ... (Keep getSearchResults, getExploreFeed, and other functions as provided previously)
 /* ======================================================
    3. CATEGORY ROWS (OPTIMIZED & FIXED)
    ====================================================== */
