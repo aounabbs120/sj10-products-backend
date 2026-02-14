@@ -472,35 +472,31 @@ exports.getSearchSuggestions = async (req, res) => {
     } catch(e) { res.json([]); }
 };
 
-// api/controllers/productController.js
-
-// ... (Keep existing imports: clients, viewsClient, db, etc.)
-
-/* ======================================================
-   🔥 FIXED: SMART PEEL STRATEGY & ENRICHED DATA 🔥
-   ====================================================== */
+// --- 1. SINGLE PRODUCT (ENHANCED) ---
 exports.getProductBySlug = async (req, res) => {
     try {
         let rawParam = req.params.slug || req.params.id;
         if (!rawParam || rawParam === 'undefined') {
-            return res.status(400).json({ message: "Invalid Product Identifier" });
+            return res.status(400).json({ message: "Invalid Identifier" });
         }
 
         const decodedParam = decodeURIComponent(rawParam).trim();
         const shardKeys = Object.keys(clients);
         const lookupOps = [];
 
-        // ... (Keep existing SKU/Slug peeling logic here) ...
+        // Candidates for lookup
         const candidates = new Set();
         candidates.add(decodedParam);
         const idMatch = decodedParam.match(/--(\d+)$/);
         const extractedId = idMatch ? idMatch[1] : null;
+        
         const parts = decodedParam.split('-');
         if (parts.length > 1) {
             candidates.add(parts.slice(0, -1).join('-')); 
             if (parts.length > 2) candidates.add(parts.slice(0, -2).join('-'));
         }
 
+        // Execute Lookup
         shardKeys.forEach(key => {
             const client = clients[key];
             if (extractedId) {
@@ -517,70 +513,48 @@ exports.getProductBySlug = async (req, res) => {
         });
 
         const results = await Promise.all(lookupOps);
-        
         let match = null;
         if (extractedId) match = results.find(r => r && String(r.p.id) === String(extractedId));
         if (!match) {
             const validMatches = results.filter(r => r);
-            match = validMatches.find(r => candidates.has(r.p.slug));
-            if (!match) match = validMatches[0];
+            match = validMatches.find(r => candidates.has(r.p.slug)) || validMatches[0];
         }
 
         if (!match) return res.status(404).json({ message: "Product not found" });
 
         const product = match.p;
 
-        // --- NEW: FETCH EXTRA STATS & BADGES ---
-        const [
-            [sup], 
-            [rev], 
-            rel, 
-            varRes,
-            [favCount], // Favorites Count
-            [promoted], // Promoted Status
-            [discount]  // Dynamic Discount
-        ] = await Promise.all([
+        // --- ENHANCED FETCHING ---
+        const [[sup], [rev], varRes, [viewsRes], [promoRes], [discRes]] = await Promise.all([
             db.suppliers.query("SELECT id, brand_name as name, profile_pic, average_rating, followers_count, verified_status, total_products, city FROM suppliers WHERE id = ?", [product.supplier_id]),
-            db.reviews.query("SELECT * FROM reviews WHERE product_id = ? ORDER BY created_at DESC LIMIT 5", [product.id]),
-            clients[match.key].execute({ sql: "SELECT * FROM products WHERE category_id = ? AND id != ? LIMIT 15", args: [product.category_id, product.id] }),
+            db.reviews.query("SELECT * FROM reviews WHERE product_id = ? ORDER BY created_at DESC", [product.id]),
             clients[match.key].execute({ sql: "SELECT * FROM variants WHERE product_id = ?", args: [product.id] }),
-            // 1. Favorites Count
-            db.db_social.query("SELECT COUNT(*) as count FROM product_favorites WHERE product_id = ?", [product.id]),
-            // 2. Promoted Status
-            db.inventory.query("SELECT id FROM promoted_products WHERE product_id = ? AND payment_status = 'paid' AND start_date <= NOW() AND end_date >= NOW() LIMIT 1", [product.id]),
-            // 3. Discount Label
-            db.inventory.query("SELECT d.name FROM discount_products dp JOIN discounts d ON dp.discount_id = d.id WHERE dp.product_id = ? AND d.is_active = 1 LIMIT 1", [product.id])
+            // Views
+            viewsClient ? viewsClient.execute({ sql: "SELECT views FROM product_views WHERE product_id = ?", args: [product.id] }).catch(()=>({rows:[{views:0}]})) : {rows:[{views:0}]},
+            // Promoted
+            db.inventory.query("SELECT id FROM promoted_products WHERE product_id = ? AND end_date >= NOW()", [product.id]),
+            // Discount Label
+            db.inventory.query(`SELECT d.name FROM discount_products dp JOIN discounts d ON dp.discount_id = d.id WHERE dp.product_id = ? AND d.is_active = 1`, [product.id])
         ]);
-
-        // Get View Count from Views DB
-        let viewCount = 0;
-        try {
-            const vRes = await viewsClient.execute({ sql: "SELECT views FROM product_views WHERE product_id = ?", args: [product.id] });
-            viewCount = vRes.rows[0]?.views || 0;
-        } catch(e) {}
 
         const sData = sup[0] || {};
         const isVerified = ['verified', 'true', '1'].includes(String(sData.verified_status).toLowerCase());
-
-        // Construct Response
+        
         let image_urls = [];
         try { image_urls = typeof product.image_urls === 'string' ? JSON.parse(product.image_urls) : product.image_urls; } catch (e) {}
-
-        // Enrich Related Products
-        const relatedEnriched = await constructProductCards(rel.rows); // Ensure this function exists in your controller (from previous code)
 
         res.json({ 
             ...product, 
             image_urls,
+            sku: product.sku || product.id, 
             price: parseFloat(product.price),
             discounted_price: parseFloat(product.discounted_price || product.price),
             
             // New Fields
-            views: viewCount,
-            favorites_count: favCount[0]?.count || 0,
-            is_promoted: promoted.length > 0,
-            discount_label: discount.length > 0 ? discount[0].name : null,
-            
+            views: viewsRes.rows[0]?.views || 0,
+            is_promoted: promoRes.length > 0 && promoRes[0].length > 0,
+            discount_label: (discRes.length > 0 && discRes[0].length > 0) ? discRes[0][0].name : null,
+
             supplier_verified: isVerified,
             supplier: { 
                 ...sData, 
@@ -588,18 +562,42 @@ exports.getProductBySlug = async (req, res) => {
                 is_verified: isVerified
             }, 
             reviews: rev, 
-            related_products: relatedEnriched,
             variants: varRes.rows || [],
             avg_rating: rev.length > 0 ? (rev.reduce((a, b) => a + parseFloat(b.rating), 0) / rev.length) : 0 
         });
 
     } catch (e) { 
-        console.error("GetProduct Critical Error:", e);
         res.status(500).json({ message: "Server Error" }); 
     }
 };
 
-// ... (Keep getSearchResults, getExploreFeed, and other functions as provided previously)
+
+// --- 2. GENERAL PRODUCTS (For More from Seller) ---
+exports.getProducts = async (req, res) => {
+    try {
+        const { supplierId, limit = 20 } = req.query;
+        let sql = "SELECT * FROM products WHERE status = 'in_stock'";
+        const args = [];
+
+        if (supplierId) {
+            sql += " AND supplier_id = ?";
+            args.push(supplierId);
+        }
+
+        sql += ` ORDER BY created_at DESC LIMIT ?`;
+        args.push(parseInt(limit));
+
+        const results = await exports.queryAllShards(sql, args);
+        const enriched = await constructProductCards(results);
+        
+        res.json(enriched);
+    } catch (e) {
+        res.status(500).json([]);
+    }
+};
+
+
+
 /* ======================================================
    3. CATEGORY ROWS (OPTIMIZED & FIXED)
    ====================================================== */
