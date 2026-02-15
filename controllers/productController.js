@@ -292,30 +292,74 @@ exports.getSearchSuggestionsText = async (req, res) => {
         res.json([]); 
     }
 };
+/* ======================================================
+   🔥 UPDATED: EXPLORE FEED (Fixes 'More from Seller') 🔥
+   ====================================================== */
 exports.getExploreFeed = async (req, res) => {
     try {
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 40;
         const offset = (page - 1) * limit;
-        const { sort = 'default', hasVideo, showVerified, search, category_id, rating, minPrice, maxPrice, city } = req.query;
+        
+        // Destructure all possible filters
+        const { 
+            sort = 'default', 
+            hasVideo, 
+            showVerified, 
+            search, 
+            category_id, 
+            supplierId, // <--- ADDED THIS
+            rating, 
+            minPrice, 
+            maxPrice, 
+            city 
+        } = req.query;
 
         let sql = `SELECT * FROM products WHERE status = 'in_stock'`;
         let countSql = `SELECT COUNT(*) as total FROM products WHERE status = 'in_stock'`;
         let args = [];
 
-        if (search) { const term = `%${search.trim().toLowerCase()}%`; sql += ` AND LOWER(title) LIKE ?`; countSql += ` AND LOWER(title) LIKE ?`; args.push(term); }
+        // --- FILTER LOGIC ---
+        if (search) { 
+            const term = `%${search.trim().toLowerCase()}%`; 
+            sql += ` AND LOWER(title) LIKE ?`; 
+            countSql += ` AND LOWER(title) LIKE ?`; 
+            args.push(term); 
+        }
+
+        // Fix for More From Seller
+        if (supplierId) {
+            sql += ` AND supplier_id = ?`;
+            countSql += ` AND supplier_id = ?`;
+            args.push(supplierId);
+        }
+
         if (category_id && category_id.trim() !== '') {
             const selectedIds = category_id.split(',').map(id => id.trim()).filter(Boolean);
             const idsPlaceholder = selectedIds.map(() => '?').join(',');
-            sql += ` AND category_id IN (${idsPlaceholder})`; countSql += ` AND category_id IN (${idsPlaceholder})`; args.push(...selectedIds);
+            sql += ` AND category_id IN (${idsPlaceholder})`; 
+            countSql += ` AND category_id IN (${idsPlaceholder})`; 
+            args.push(...selectedIds);
         }
-        if (minPrice) { sql += ` AND (discounted_price >= ? OR price >= ?)`; countSql += ` AND (discounted_price >= ? OR price >= ?)`; args.push(minPrice, minPrice); }
-        if (maxPrice) { sql += ` AND (discounted_price <= ? OR price <= ?)`; countSql += ` AND (discounted_price <= ? OR price <= ?)`; args.push(maxPrice, maxPrice); }
 
+        if (minPrice) { 
+            sql += ` AND (discounted_price >= ? OR price >= ?)`; 
+            countSql += ` AND (discounted_price >= ? OR price >= ?)`; 
+            args.push(minPrice, minPrice); 
+        }
+        if (maxPrice) { 
+            sql += ` AND (discounted_price <= ? OR price <= ?)`; 
+            countSql += ` AND (discounted_price <= ? OR price <= ?)`; 
+            args.push(maxPrice, maxPrice); 
+        }
+
+        // --- EXECUTION ---
         const shouldCount = page === 1;
         const clientValues = Object.values(clients).filter(Boolean);
+        
         const promises = clientValues.map(async (client) => {
             try {
+                // Ensure we fetch enough to sort later
                 const pRes = await client.execute({ sql: sql + ` LIMIT 150`, args });
                 let count = 0;
                 if (shouldCount) {
@@ -331,19 +375,21 @@ exports.getExploreFeed = async (req, res) => {
         let realTotalCount = 0;
         results.forEach(r => { allProducts.push(...r.products); realTotalCount += r.count; });
 
-        // 🔥 USE THE CONSTRUCTOR 🔥
+        // 🔥 Construct Cards (Adds Badges, Ratings, etc) 🔥
         let finalProducts = await constructProductCards(allProducts);
 
-        // Sorting & Filtering (In-Memory)
+        // --- IN-MEMORY FILTERING ---
         if (hasVideo === 'true') finalProducts = finalProducts.filter(p => p.has_video);
         if (showVerified === 'true') finalProducts = finalProducts.filter(p => p.supplier_verified);
         if (rating) finalProducts = finalProducts.filter(p => Math.round(p.avg_rating) >= parseInt(rating));
         if (city && city !== 'All') finalProducts = finalProducts.filter(p => p.supplier_city?.toLowerCase() === city.toLowerCase());
 
+        // --- SORTING ---
         if (sort === 'newest') finalProducts.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
         else if (sort === 'price_low_high') finalProducts.sort((a, b) => (a.discounted_price || a.price) - (b.discounted_price || b.price));
         else if (sort === 'price_high_low') finalProducts.sort((a, b) => (b.discounted_price || b.price) - (a.discounted_price || a.price));
-        else { // Default
+        else { 
+            // Default: Most reviewed, then most viewed
             finalProducts.sort((a, b) => {
                 if (b.review_count !== a.review_count) return b.review_count - a.review_count;
                 return b.views - a.views;
@@ -360,6 +406,38 @@ exports.getExploreFeed = async (req, res) => {
     } catch (e) {
         console.error("Explore Error:", e);
         res.status(200).json({ products: [], totalCount: 0 });
+    }
+};
+
+
+exports.getProductStats = async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        // 1. Get Views from Turso
+        let views = 0;
+        try {
+            const vRes = await viewsClient.execute({ 
+                sql: "SELECT views FROM product_views WHERE product_id = ?", 
+                args: [id] 
+            });
+            if (vRes.rows.length > 0) views = vRes.rows[0].views;
+        } catch (e) { console.error("Turso View Error", e); }
+
+        // 2. Get Favorites Count from MySQL
+        let favorites = 0;
+        if (db.db_social) {
+            const [rows] = await db.db_social.query(
+                "SELECT COUNT(*) as total FROM product_favorites WHERE product_id = ?", 
+                [id]
+            );
+            favorites = rows[0].total;
+        }
+
+        res.json({ views, favorites });
+    } catch (error) {
+        console.error("Stats Error:", error);
+        res.status(500).json({ views: 0, favorites: 0 });
     }
 };
 
@@ -473,13 +551,14 @@ exports.getSearchSuggestions = async (req, res) => {
 };
 
 /* ======================================================
-   🔥 FIXED: SMART PEEL STRATEGY (Handles SKUs with hyphens) 🔥
+   🔥 FULLY UPDATED: GET PRODUCT BY SLUG 🔥
+   - Fixes View Count (Fetches from Turso Views Table)
+   - Fixes Favorites Count (Counts rows in MySQL Social DB)
+   - Handles "Smart Peel" for Slug matching
    ====================================================== */
 exports.getProductBySlug = async (req, res) => {
     try {
-        // 1. LOGGING
-        console.log("🔍 Incoming Request Params:", req.params);
-
+        // 1. Validate Input
         let rawParam = req.params.slug || req.params.id;
         if (!rawParam || rawParam === 'undefined') {
             return res.status(400).json({ message: "Invalid Product Identifier" });
@@ -489,128 +568,141 @@ exports.getProductBySlug = async (req, res) => {
         const shardKeys = Object.keys(clients);
         const lookupOps = [];
 
-        // --- STEP 1: PREPARE CANDIDATES ---
+        // --- STEP 2: SMART PEEL STRATEGY (Find the Product) ---
         const candidates = new Set();
-        candidates.add(decodedParam); // 1. Try exact match (e.g. just the slug)
+        candidates.add(decodedParam); 
 
-        // 2. Try ID Match (Pattern: ends with "--12")
+        // Pattern: ends with "--123" (ID extraction)
         const idMatch = decodedParam.match(/--(\d+)$/);
         const extractedId = idMatch ? idMatch[1] : null;
 
-        // 3. Try "Smart Peel" for Slug detection
-        // If URL is "my-product-slug-SJ10-180646"
-        // It tries:
-        // A. "my-product-slug-SJ10-180646" (Slug match)
-        // B. "my-product-slug-SJ10"        (Assuming '180646' is SKU)
-        // C. "my-product-slug"             (Assuming 'SJ10-180646' is SKU)
-        
         const parts = decodedParam.split('-');
         if (parts.length > 1) {
-            // Peel off the last part
             candidates.add(parts.slice(0, -1).join('-')); 
-            // Peel off the last 2 parts (Common for SKUs like 'SJ10-123')
-            if (parts.length > 2) {
-                candidates.add(parts.slice(0, -2).join('-'));
-            }
+            if (parts.length > 2) candidates.add(parts.slice(0, -2).join('-'));
         }
 
-        // --- STEP 2: BUILD PARALLEL QUERIES ---
+        // Search all shards in parallel
         shardKeys.forEach(key => {
             const client = clients[key];
-
-            // A. Search by ID (Highest Priority)
+            
+            // A. ID Match
             if (extractedId) {
-                lookupOps.push(
-                    client.execute({ sql: "SELECT * FROM products WHERE id = ? LIMIT 1", args: [extractedId] })
-                        .then(r => r.rows.length ? { p: r.rows[0], key } : null)
-                        .catch(() => null)
-                );
+                lookupOps.push(client.execute({ sql: "SELECT * FROM products WHERE id = ? LIMIT 1", args: [extractedId] }).then(r => r.rows.length ? { p: r.rows[0], key } : null).catch(() => null));
             }
-
-            // B. Search for ALL Slug Candidates in parallel
+            // B. Slug Match
             candidates.forEach(slugCandidate => {
-                lookupOps.push(
-                    client.execute({ sql: "SELECT * FROM products WHERE slug = ? LIMIT 1", args: [slugCandidate] })
-                        .then(r => r.rows.length ? { p: r.rows[0], key } : null)
-                        .catch(() => null)
-                );
+                lookupOps.push(client.execute({ sql: "SELECT * FROM products WHERE slug = ? LIMIT 1", args: [slugCandidate] }).then(r => r.rows.length ? { p: r.rows[0], key } : null).catch(() => null));
             });
-
-            // C. Search by Exact SKU (using full param just in case)
-            // Or try the suffix strategy for SKU
-            const potentialSku = parts[parts.length - 1]; // Try simple suffix
+            // C. SKU Match (Last part)
+            const potentialSku = parts[parts.length - 1]; 
             if (potentialSku) {
-                lookupOps.push(
-                    client.execute({ sql: "SELECT * FROM products WHERE sku = ? LIMIT 1", args: [potentialSku] })
-                        .then(r => r.rows.length ? { p: r.rows[0], key } : null)
-                        .catch(() => null)
-                );
+                lookupOps.push(client.execute({ sql: "SELECT * FROM products WHERE sku = ? LIMIT 1", args: [potentialSku] }).then(r => r.rows.length ? { p: r.rows[0], key } : null).catch(() => null));
             }
         });
 
-        // --- STEP 3: EXECUTE & SELECT BEST MATCH ---
         const results = await Promise.all(lookupOps);
         
-        // Priority: 
-        // 1. ID Match
-        // 2. Slug Match (Longest matching slug wins to avoid partial matches)
-        // 3. SKU Match
-        
+        // Priority: ID > Slug > SKU
         let match = null;
-
-        if (extractedId) {
-            match = results.find(r => r && String(r.p.id) === String(extractedId));
-        }
-
+        if (extractedId) match = results.find(r => r && String(r.p.id) === String(extractedId));
         if (!match) {
-            // Sort matches by slug length descending (so "my-product" doesn't match "my-product-2")
             const validMatches = results.filter(r => r);
-            
-            // Find one where the DB slug matches one of our candidates
-            match = validMatches.find(r => candidates.has(r.p.slug));
-            
-            // Fallback: SKU match
-            if (!match) match = validMatches[0];
+            match = validMatches.find(r => candidates.has(r.p.slug)) || validMatches[0];
         }
 
         if (!match) {
-            console.log(`❌ Product Not Found in DB: ${decodedParam}`);
             return res.status(404).json({ message: "Product not found" });
         }
 
         const product = match.p;
 
-        // --- STEP 4: FETCH RELATED DATA ---
-        let image_urls = [];
-        try { image_urls = typeof product.image_urls === 'string' ? JSON.parse(product.image_urls) : product.image_urls; } catch (e) {}
+        // --- STEP 3: PARALLEL DATA FETCHING (Views, Favs, Reviews, etc) ---
+        
+        // A. Prepare View Count Promise (Turso)
+        const viewCountPromise = viewsClient ? viewsClient.execute({
+            sql: "SELECT views FROM product_views WHERE product_id = ?",
+            args: [product.id]
+        }).catch(e => ({ rows: [] })) : Promise.resolve({ rows: [] });
 
-        const [[sup], [rev], rel, varRes] = await Promise.all([
+        // B. Prepare Favorites Count Promise (MySQL)
+        const favCountPromise = db.db_social ? db.db_social.query(
+            "SELECT COUNT(*) as total FROM product_favorites WHERE product_id = ?",
+            [product.id]
+        ).catch(e => [[{ total: 0 }]]) : Promise.resolve([[{ total: 0 }]]);
+
+        // C. Fetch Everything
+        const [
+            [sup],           // Supplier Info
+            [rev],           // Reviews
+            rel,             // Related Products
+            varRes,          // Variants
+            viewRes,         // Views Result
+            [favRes],        // Favorites Result
+            [promotedRes]    // Check if Promoted
+        ] = await Promise.all([
             db.suppliers.query("SELECT id, brand_name as name, profile_pic, average_rating, followers_count, verified_status, total_products, city FROM suppliers WHERE id = ?", [product.supplier_id]),
             db.reviews.query("SELECT * FROM reviews WHERE product_id = ? ORDER BY created_at DESC LIMIT 5", [product.id]),
             clients[match.key].execute({ sql: "SELECT * FROM products WHERE category_id = ? AND id != ? LIMIT 8", args: [product.category_id, product.id] }),
-            clients[match.key].execute({ sql: "SELECT * FROM variants WHERE product_id = ?", args: [product.id] })
+            clients[match.key].execute({ sql: "SELECT * FROM variants WHERE product_id = ?", args: [product.id] }),
+            viewCountPromise,
+            favCountPromise,
+            db.inventory.query("SELECT id FROM promoted_products WHERE product_id = ? AND payment_status='paid' AND end_date > NOW()", [product.id]).catch(()=>[[]])
         ]);
 
+        // --- STEP 4: DATA PROCESSING ---
+
+        // Images
+        let image_urls = [];
+        try { image_urls = typeof product.image_urls === 'string' ? JSON.parse(product.image_urls) : product.image_urls; } catch (e) {}
+
+        // Supplier
         const sData = sup[0] || {};
         const isVerified = ['verified', 'true', '1'].includes(String(sData.verified_status).toLowerCase());
 
+        // Counts
+        const realViews = viewRes.rows.length > 0 ? viewRes.rows[0].views : 0;
+        const realFavorites = favRes[0]?.total || 0;
+
+        // Enrich Related Products (Add badges/ratings to slider)
         const relatedEnriched = await constructProductCards(rel.rows);
 
+        // Check Promoted
+        const isPromoted = promotedRes.length > 0;
+
+        // --- STEP 5: FINAL RESPONSE ---
         res.json({ 
             ...product, 
             image_urls,
             price: parseFloat(product.price),
             discounted_price: parseFloat(product.discounted_price || product.price),
+            
+            // Supplier Data
             supplier_verified: isVerified,
             supplier: { 
                 ...sData, 
                 verified_status: isVerified ? 'verified' : 'unverified',
                 is_verified: isVerified
             }, 
+            
+            // Reviews & Ratings
             reviews: rev, 
+            avg_rating: rev.length > 0 ? (rev.reduce((a, b) => a + parseFloat(b.rating), 0) / rev.length) : 0,
+            
+            // Related Items
             related_products: relatedEnriched,
             variants: varRes.rows || [],
-            avg_rating: rev.length > 0 ? (rev.reduce((a, b) => a + parseFloat(b.rating), 0) / rev.length) : 0 
+            
+            // 🔥 CRITICAL STATS 🔥
+            views: realViews,          // Fetched from Turso
+            favorites: realFavorites,  // Fetched from MySQL
+            is_promoted: isPromoted,   // Fetched from MySQL
+            
+            // Helper for initial stats on frontend
+            stats: {
+                views: realViews,
+                favorites: realFavorites
+            }
         });
 
     } catch (e) { 
@@ -618,7 +710,6 @@ exports.getProductBySlug = async (req, res) => {
         res.status(500).json({ message: "Server Error" }); 
     }
 };
-
 /* ======================================================
    3. CATEGORY ROWS (OPTIMIZED & FIXED)
    ====================================================== */

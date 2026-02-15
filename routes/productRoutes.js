@@ -19,7 +19,7 @@ router.get('/suggestions', productController.getSearchSuggestions);
 
 // --- CATEGORY ---
 router.get('/category/:slug', productController.getProductsByCategorySlug);
-
+router.get('/:id/stats', productController.getProductStats);
 // --- SINGLE PRODUCT ROUTES (THE FIX) ---
 
 // 1. Matches: /api/products/slug/bike-cover--12
