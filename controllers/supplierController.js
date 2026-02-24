@@ -50,3 +50,17 @@ exports.getSupplierById = async (req, res) => {
         res.status(500).json({ message: "Server Error", error: error.message });
     }
 };
+
+exports.getAllSupplierIds = async (req, res) => {
+    try {
+        // Fetch all verified/active suppliers quickly
+        const [rows] = await db.suppliers.query(
+            "SELECT id FROM suppliers WHERE verified_status = 'verified' OR verified_status = '1'"
+        );
+        const ids = rows.map(r => r.id);
+        res.json(ids);
+    } catch (error) {
+        console.error("Supplier Sitemap Error:", error);
+        res.status(500).json([]);
+    }
+};
