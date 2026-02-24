@@ -951,3 +951,40 @@ exports.getProductById = async (req, res) => {
 };
 
 // --- THIS LINE ALSO NEEDS TO BE IN THE FILE to export getExploreFeed correctly if you replaced getAllProducts logic completely
+
+
+
+
+
+/* ======================================================
+   🔥 NEW: DEDICATED SITEMAP GENERATOR 🔥
+   Fetches ALL slugs from ALL shards instantly without heavy joins.
+   ====================================================== */
+exports.getSitemapUrls = async (req, res) => {
+    try {
+        console.log("🗺️ Generating Full Sitemap...");
+        // We only fetch slug and created_at. No images, no prices. Super fast.
+        const sql = `SELECT slug, created_at FROM products WHERE status = 'in_stock'`;
+        
+        const clientValues = Object.values(clients).filter(Boolean);
+        
+        const promises = clientValues.map(async (client) => {
+            try {
+                const pRes = await client.execute(sql);
+                return pRes.rows || [];
+            } catch (e) { 
+                return []; 
+            }
+        });
+
+        const results = await Promise.all(promises);
+        const allProducts = results.flat();
+
+        console.log(`✅ Sent ${allProducts.length} URLs to Sitemap`);
+        res.json(allProducts);
+
+    } catch (e) {
+        console.error("Sitemap Error:", e);
+        res.status(500).json([]);
+    }
+};

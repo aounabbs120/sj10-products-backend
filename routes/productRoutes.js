@@ -6,6 +6,7 @@ const authenticateUser = require('../middleware/authenticateUser');
 
 // --- HOMEPAGE & STATIC DATA ---
 router.get('/homepage-data', productController.getHomepageData);
+router.get('/sitemap-urls', productController.getSitemapUrls);
 router.get('/category-rows', productController.getCategoryRows);
 router.get('/categories-with-subcategories', productController.getCategoriesWithSubcategories);
 router.get('/active-timer', productController.getActivePromotionalTimer);
