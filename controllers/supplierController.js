@@ -8,7 +8,7 @@ exports.getSupplierById = async (req, res) => {
         
         // Fetch Supplier Details including the new stats
         const [rows] = await db.suppliers.query(
-            "SELECT id, name, profile_pic, followers_count, average_rating, total_reviews, verified_status FROM suppliers WHERE id = ?", 
+            "SELECT id, name, profile_pic, followers_count, average_rating, total_reviews, verified_status, total_products FROM suppliers WHERE id = ?", 
             [supplierId]
         );
 
