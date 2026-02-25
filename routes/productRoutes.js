@@ -5,6 +5,8 @@ const reviewController = require('../controllers/reviewController');
 const authenticateUser = require('../middleware/authenticateUser');
 
 // --- HOMEPAGE & STATIC DATA ---
+// Add near the top of the file
+router.get('/sitemap-count', productController.getSitemapCount);
 router.get('/homepage-data', productController.getHomepageData);
 router.get('/sitemap-urls', productController.getSitemapUrls);
 router.get('/category-rows', productController.getCategoryRows);

@@ -956,35 +956,80 @@ exports.getProductById = async (req, res) => {
 
 
 
+// Inside productController.js
+
 /* ======================================================
-   🔥 NEW: DEDICATED SITEMAP GENERATOR 🔥
-   Fetches ALL slugs from ALL shards instantly without heavy joins.
+   🔥 10/10 SITEMAP GENERATOR (No status filter) 🔥
    ====================================================== */
 exports.getSitemapUrls = async (req, res) => {
     try {
-        console.log("🗺️ Generating Full Sitemap...");
-        // We only fetch slug and created_at. No images, no prices. Super fast.
-       const sql = `SELECT slug, sku, created_at FROM products WHERE status = 'in_stock'`;
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 49000;
+        const offset = (page - 1) * limit;
+
+        // REMOVED: "WHERE status = 'in_stock'" to include all products
+        const sql = `
+            SELECT slug, sku, COALESCE(updated_at, created_at) as lastmod 
+            FROM products 
+            LIMIT ? OFFSET ?
+        `;
+        const countSql = `SELECT COUNT(id) as total FROM products`;
         
         const clientValues = Object.values(clients).filter(Boolean);
         
-        const promises = clientValues.map(async (client) => {
-            try {
-                const pRes = await client.execute(sql);
-                return pRes.rows || [];
-            } catch (e) { 
-                return []; 
-            }
-        });
+        const promises = clientValues.map(client => 
+            Promise.all([
+                client.execute({ sql, args: [limit, offset] }).then(r => r.rows || []),
+                // We only run count on page 1 for efficiency
+                page === 1 ? client.execute(countSql).then(r => r.rows[0]?.total || 0) : 0
+            ]).catch(() => [[], 0])
+        );
 
         const results = await Promise.all(promises);
-        const allProducts = results.flat();
+        
+        let allProducts = [];
+        let totalCount = 0;
+        results.forEach(([products, count]) => {
+            allProducts.push(...products);
+            totalCount += count;
+        });
 
-        console.log(`✅ Sent ${allProducts.length} URLs to Sitemap`);
-        res.json(allProducts);
+        res.json({
+            products: allProducts,
+            // Only send totalCount if it was actually calculated on page 1
+            ...(page === 1 && { totalCount: totalCount })
+        });
 
     } catch (e) {
-        console.error("Sitemap Error:", e);
-        res.status(500).json([]);
+        console.error("Sitemap URL Generation Error:", e);
+        res.status(500).json({ products: [], totalCount: 0 });
+    }
+};
+
+
+// Add this new function anywhere in productController.js
+
+/* ======================================================
+   🔥 LIGHTWEIGHT COUNT ENDPOINT 🔥
+   ====================================================== */
+exports.getSitemapCount = async (req, res) => {
+    try {
+        const countSql = `SELECT COUNT(id) as total FROM products`;
+        const clientValues = Object.values(clients).filter(Boolean);
+        
+        const promises = clientValues.map(client =>
+            client.execute(countSql).then(r => r.rows[0]?.total || 0).catch(() => 0)
+        );
+        
+        const results = await Promise.all(promises);
+        const totalCount = results.reduce((sum, count) => sum + count, 0);
+
+        // Set a short cache, as this is hit frequently by Google
+        res.set('Cache-Control', 'public, s-maxage=3600'); // Cache for 1 hour
+        res.json({ total: totalCount });
+
+    } catch (e) {
+        console.error("Sitemap Count Error:", e);
+        res.status(500).json({ total: 0 });
     }
 };
