@@ -964,7 +964,7 @@ exports.getSitemapUrls = async (req, res) => {
     try {
         console.log("🗺️ Generating Full Sitemap...");
         // We only fetch slug and created_at. No images, no prices. Super fast.
-        const sql = `SELECT slug, created_at FROM products WHERE status = 'in_stock'`;
+       const sql = `SELECT slug, sku, created_at FROM products WHERE status = 'in_stock'`;
         
         const clientValues = Object.values(clients).filter(Boolean);
         
