@@ -968,11 +968,11 @@ exports.getSitemapUrls = async (req, res) => {
         const offset = (page - 1) * limit;
 
         // REMOVED: "WHERE status = 'in_stock'" to include all products
-        const sql = `
-            SELECT slug, sku, COALESCE(updated_at, created_at) as lastmod 
-            FROM products 
-            LIMIT ? OFFSET ?
-        `;
+       const sql = `
+    SELECT slug, sku, created_at as lastmod 
+    FROM products 
+    LIMIT ? OFFSET ?
+`;
         const countSql = `SELECT COUNT(id) as total FROM products`;
         
         const clientValues = Object.values(clients).filter(Boolean);
@@ -986,7 +986,7 @@ exports.getSitemapUrls = async (req, res) => {
         );
 
         const results = await Promise.all(promises);
-        
+         console.log("Database results from all shards:", results);
         let allProducts = [];
         let totalCount = 0;
         results.forEach(([products, count]) => {
@@ -1001,9 +1001,15 @@ exports.getSitemapUrls = async (req, res) => {
         });
 
     } catch (e) {
-        console.error("Sitemap URL Generation Error:", e);
-        res.status(500).json({ products: [], totalCount: 0 });
-    }
+    console.error("Sitemap URL Generation Error:", e);
+    // This will send the real database error message to your browser for debugging
+    res.status(500).json({
+        message: "Your backend had an error fetching sitemap URLs.",
+        error: e.message, 
+        products: [],
+        totalCount: 0
+    });
+}
 };
 
 
