@@ -442,65 +442,104 @@ exports.getProductStats = async (req, res) => {
 };
 
 /* ======================================================
-   2. HOMEPAGE DATA (Controller Update)
+   2. HOMEPAGE DATA (Controller Update) - TRULY POPULAR FIX
    ====================================================== */
 exports.getHomepageData = async (req, res) => {
     try {
-        const[bannersRes, promotedRes, catsRes, ...shardResults] = await Promise.all([
-            db.inventory.query("SELECT id, image_url, link_url FROM banners WHERE is_active = 1"),
-            db.inventory.query("SELECT product_id FROM promoted_products WHERE payment_status = 'paid' AND start_date <= NOW() AND end_date >= NOW() ORDER BY start_date DESC"),
-            db.inventory.query("SELECT id, name, image_url, slug, parent_id FROM categories ORDER BY name ASC"),
-            ...Object.values(clients).map(c => c.execute("SELECT * FROM products WHERE status = 'in_stock' ORDER BY created_at DESC LIMIT 100"))
+        // 1. Fetch Basic Homepage Data (Banners & Categories)
+        const [bannersRes, catsRes] = await Promise.all([
+            db.inventory.query("SELECT id, image_url, link_url FROM banners WHERE is_active = 1").catch(() => [[ ]]),
+            db.inventory.query("SELECT id, name, image_url, slug, parent_id FROM categories ORDER BY name ASC").catch(() => [[ ]])
         ]);
 
-        const [banners] = bannersRes;
-        const[promotedRows] = promotedRes;
-        const [allCats] = catsRes;
+        // 2. Fetch IDs for Promoted, Most Reviewed, and Most Viewed explicitly!
+        const[promotedRows, topReviewedRows, topViewedRes] = await Promise.all([
+            db.inventory.query("SELECT product_id FROM promoted_products WHERE payment_status = 'paid' AND start_date <= NOW() AND end_date >= NOW() ORDER BY start_date DESC").catch(() => [[ ]]),
+            
+            // 🔥 FETCH ACTUAL MOST REVIEWED IDs FROM MYSQL
+            db.reviews.query("SELECT product_id FROM product_ratings ORDER BY review_count DESC, avg_rating DESC LIMIT 50").catch(() => [[ ]]),
+            
+            // 🔥 FETCH ACTUAL MOST VIEWED IDs FROM TURSO
+            viewsClient ? viewsClient.execute("SELECT product_id FROM product_views ORDER BY views DESC LIMIT 50").catch(() => ({ rows: [] })) : Promise.resolve({ rows:[] })
+        ]);
 
-        const promotedIds = new Set(promotedRows.map(r => r.product_id));
-        const top50PromotedIds = [...promotedIds].slice(0, 50); 
-        let promotedProductsFull = await getProductsFromTursoByIds(top50PromotedIds);
-        const promotedTop50 = await constructProductCards(promotedProductsFull); 
+        // 3. Extract the IDs safely
+        const promotedIds =[...new Set(promotedRows[0].map(r => String(r.product_id)))].slice(0, 50);
+        
+        // Combine Reviewed IDs and Viewed IDs into one "Popular" pool
+        const popularIds = [...new Set([
+            ...topReviewedRows[0].map(r => String(r.product_id)),
+            ...topViewedRes.rows.map(r => String(r.product_id))
+        ])].slice(0, 100);
 
-        let generalProducts = shardResults.map(res => res.rows).flat().filter(p => !promotedIds.has(p.id));
-        const enrichedGeneralProducts = await constructProductCards(generalProducts);
+        // 4. Fetch the actual products from Turso using the specific IDs
+        // Also fetch the newest products directly for the Latest section
+        const[promotedProductsRaw, popularProductsRaw, ...shardLatestResults] = await Promise.all([
+            getProductsFromTursoByIds(promotedIds),
+            getProductsFromTursoByIds(popularIds),
+            ...Object.values(clients).map(c => c.execute("SELECT * FROM products WHERE status = 'in_stock' ORDER BY created_at DESC LIMIT 20").catch(() => ({ rows: [] })))
+        ]);
 
-        // ==========================================================
-        // 🔥 POPULAR PRODUCTS: 1. Reviews -> 2. Views -> 3. Newest
-        // ==========================================================
-        const popularMixed = [...enrichedGeneralProducts]
-            .sort((a, b) => {
-                // Force to Integer to prevent string comparison bugs
-                const reviewsA = parseInt(a.review_count) || 0;
-                const reviewsB = parseInt(b.review_count) || 0;
-                if (reviewsB !== reviewsA) return reviewsB - reviewsA; // Most reviews first
-                
-                const viewsA = parseInt(a.views) || 0;
-                const viewsB = parseInt(b.views) || 0;
-                if (viewsB !== viewsA) return reviewsB - viewsA; // Then most views
-                
-                return new Date(b.created_at) - new Date(a.created_at); // Tie-breaker: Newest
-            })
-            .slice(0, 100);
+        // Flatten the latest products from all shards
+        const rawLatest = shardLatestResults.map(res => res.rows).flat();
+        
+        // 5. Enrich ALL products (Attaches reviews, views, images, and verified badges safely)
+        const[promotedTop50, popularMixedRaw, enrichedLatest] = await Promise.all([
+            constructProductCards(promotedProductsRaw),
+            constructProductCards(popularProductsRaw),
+            constructProductCards(rawLatest)
+        ]);
 
-        // ==========================================================
-        // 🔥 LATEST PRODUCTS: Strictly Absolute Newest
-        // ==========================================================
-        const latestProducts = [...enrichedGeneralProducts]
+        // 6. 🔥 Final Exact Sorting for Popular (1. Reviews -> 2. Views -> 3. Newest)
+        const popularMixed = popularMixedRaw.sort((a, b) => {
+            const reviewsA = parseInt(a.review_count) || 0;
+            const reviewsB = parseInt(b.review_count) || 0;
+            if (reviewsB !== reviewsA) return reviewsB - reviewsA; // Most Reviews First
+            
+            const viewsA = parseInt(a.views) || 0;
+            const viewsB = parseInt(b.views) || 0;
+            if (viewsB !== viewsA) return viewsB - viewsA; // Then Most Views
+            
+            return new Date(b.created_at) - new Date(a.created_at); // Tie-breaker: Newest
+        });
+
+        // 7. 🔥 Final Exact Sorting for Latest (Strictly Absolute Newest)
+        const latestProducts = enrichedLatest
             .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
-            .slice(0, 50);
+            .slice(0, 50); // Keep exactly top 50 newest
 
-        const subCategoriesAll = allCats.filter(cat => cat.parent_id);
+        // 8. Format Categories (split into rows for the frontend)
+        const subCategoriesAll = catsRes[0].filter(cat => cat.parent_id);
         const subCatRow1 = subCategoriesAll.slice(0, 16);
         const subCatRow2 = subCategoriesAll.slice(16, 32);
         const subCatRow3 = subCategoriesAll.slice(32, 48);
         
+        // Set Cache to make the homepage load instantly for users
         res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=30');
-        res.json({ banners: banners ||[], subCatRow1, subCatRow2, subCatRow3, promotedTop50, popularMixed, latestProducts });
+        
+        // 9. Send Final Response
+        res.json({ 
+            banners: bannersRes[0] ||[], 
+            subCatRow1, 
+            subCatRow2, 
+            subCatRow3, 
+            promotedTop50, 
+            popularMixed, 
+            latestProducts 
+        });
 
     } catch (error) {
         console.error("Homepage Error:", error);
-        res.status(500).json({ banners: [], subCatRow1: [], subCatRow2: [], subCatRow3:[], promotedTop50: [], popularMixed: [], latestProducts:[] });
+        // Fallback response if something fails, so the site doesn't crash
+        res.status(500).json({ 
+            banners:[], 
+            subCatRow1: [], 
+            subCatRow2: [], 
+            subCatRow3:[], 
+            promotedTop50: [], 
+            popularMixed: [], 
+            latestProducts:[] 
+        });
     }
 };
 exports.getHomepageCategories = async (req, res) => {
