@@ -1040,3 +1040,73 @@ exports.getSitemapCount = async (req, res) => {
         res.status(500).json({ total: 0 });
     }
 };
+
+
+/* ======================================================
+   🔥 GOOGLE SHOPPING FEED GENERATOR (Rich Data) 🔥
+   ====================================================== */
+exports.getGoogleShoppingProducts = async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 1000;
+    const offset = (page - 1) * limit;
+
+    // 🔥 We need MORE data for Shopping Feed than Sitemap
+    const sql = `
+      SELECT id, title, slug, sku, description, price, discounted_price, image_urls, supplier_id
+      FROM products
+      WHERE status = 'in_stock'
+    `;
+
+    const clientValues = Object.values(clients).filter(Boolean);
+
+    // 1. Fetch from all shards
+    const promises = clientValues.map(client =>
+      client.execute({ sql })
+        .then(r => r.rows || [])
+        .catch(() => [])
+    );
+
+    const results = await Promise.all(promises);
+    const allProducts = results.flat();
+
+    // 2. Sort by ID for stability
+    allProducts.sort((a, b) => {
+        if (a.id && b.id) return a.id - b.id; 
+        return 0; 
+    });
+
+    // 3. Paginate
+    const paginatedProducts = allProducts.slice(offset, offset + limit);
+
+    // 4. Clean Data for XML
+    const cleanProducts = paginatedProducts.map(p => {
+        // Parse Images
+        let image = "";
+        try {
+            const parsed = typeof p.image_urls === 'string' ? JSON.parse(p.image_urls) : p.image_urls;
+            image = Array.isArray(parsed) ? parsed[0] : parsed;
+        } catch(e) { image = p.image_urls; }
+
+        return {
+            id: p.sku || `SJ10-${p.id}`,
+            title: p.title,
+            description: p.description ? p.description.substring(0, 5000) : p.title, // Limit description
+            link: p.slug, // We will build full URL in frontend
+            image_link: image,
+            price: parseFloat(p.price),
+            sale_price: parseFloat(p.discounted_price || p.price),
+            brand: "SJ10" // Default brand (or map from supplier_id if you have that data loaded)
+        };
+    });
+
+    res.json({
+      products: cleanProducts,
+      totalCount: allProducts.length
+    });
+
+  } catch (e) {
+    console.error("Shopping Feed Error:", e);
+    res.status(500).json({ products: [] });
+  }
+};
