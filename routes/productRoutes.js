@@ -8,6 +8,7 @@ const authenticateUser = require('../middleware/authenticateUser');
 // Add near the top of the file
 router.get('/sitemap-count', productController.getSitemapCount);
 router.get('/shopping-feed', productController.getGoogleShoppingProducts);
+router.get('/google-shopping-master.xml', productController.getGoogleShoppingMasterFeed);
 router.get('/homepage-data', productController.getHomepageData);
 router.get('/sitemap-urls', productController.getSitemapUrls);
 router.get('/category-rows', productController.getCategoryRows);

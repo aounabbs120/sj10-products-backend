@@ -1099,3 +1099,94 @@ exports.getGoogleShoppingProducts = async (req, res) => {
     res.status(500).json({ products: [] });
   }
 };
+
+/* ======================================================
+   🔥 GOOGLE SHOPPING MASTER FEED (1 LINK FOR EVERYTHING) 🔥
+   ====================================================== */
+exports.getGoogleShoppingMasterFeed = async (req, res) => {
+  try {
+    const BASE_URL = "https://www.sj10.pk";
+    
+    // Fetch ALL in-stock products
+    const sql = `
+      SELECT id, title, slug, sku, description, price, discounted_price, image_urls 
+      FROM products 
+      WHERE status = 'in_stock'
+    `;
+
+    const clientValues = Object.values(clients).filter(Boolean);
+    const promises = clientValues.map(client => client.execute({ sql }).then(r => r.rows ||[]).catch(() =>[]));
+    const results = await Promise.all(promises);
+    const allProducts = results.flat();
+
+    // Helper to clean XML characters
+    const escapeXml = (str) => {
+        if (!str) return "";
+        return String(str).replace(/[<>&'"]/g, (c) => {
+            switch (c) {
+                case '<': return '&lt;'; case '>': return '&gt;';
+                case '&': return '&amp;'; case '\'': return '&apos;';
+                case '"': return '&quot;'; default: return c;
+            }
+        });
+    };
+
+    // Build the XML Header
+    let xml = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">
+<channel>
+<title>SJ10.pk Master Product Feed</title>
+<link>${BASE_URL}</link>
+<description>Best Online Shopping in Pakistan</description>`;
+
+    // Loop through ALL products
+    allProducts.forEach(p => {
+        const slug = p.sku ? `${p.slug}-${p.sku}` : p.slug;
+        const fullLink = `${BASE_URL}/products/${encodeURIComponent(slug)}`;
+
+        // Extract Image
+        let imageUrl = "";
+        try {
+            if (p.image_urls) {
+                if (typeof p.image_urls === 'string') {
+                    imageUrl = p.image_urls.startsWith('[') ? JSON.parse(p.image_urls)[0] : p.image_urls;
+                } else if (Array.isArray(p.image_urls)) {
+                    imageUrl = p.image_urls[0];
+                }
+            }
+        } catch(e) {}
+
+        const price = parseFloat(p.price);
+        const salePrice = parseFloat(p.discounted_price || p.price);
+
+        xml += `
+<item>
+  <g:id>${escapeXml(p.sku || p.id)}</g:id>
+  <g:title>${escapeXml(p.title)}</g:title>
+  <g:description>${escapeXml(p.description ? p.description.substring(0, 2000) : p.title)}</g:description>
+  <g:link>${fullLink}</g:link>
+  <g:image_link>${escapeXml(imageUrl)}</g:image_link>
+  <g:condition>new</g:condition>
+  <g:availability>in stock</g:availability>
+  <g:price>${price} PKR</g:price>
+  ${salePrice < price ? `<g:sale_price>${salePrice} PKR</g:sale_price>` : ''}
+  <g:brand>SJ10</g:brand>
+  <g:identifier_exists>no</g:identifier_exists>
+</item>`;
+    });
+
+    xml += `
+</channel>
+</rss>`;
+
+    // Send as an XML File
+    res.set('Content-Type', 'application/xml');
+    // Cache for 2 hours to prevent database overload
+    res.set('Cache-Control', 'public, s-maxage=7200, stale-while-revalidate=3600');
+    res.send(xml);
+
+  } catch (e) {
+    console.error("Master Feed Error:", e);
+    res.status(500).send("Error generating feed");
+  }
+};
