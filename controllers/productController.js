@@ -72,14 +72,14 @@ const enrichWithSupplierDetails = async (products) => {
     }
 };
 /* ==========================================================================
-   🔥 GLOBAL CARD CONSTRUCTOR (Dedicated Function for All Pages) 🔥
+   🔥 GLOBAL CARD CONSTRUCTOR (THE DEFINITIVE FIX IS HERE) 🔥
    
    This function runs for Home, Explore, Category, and Search.
    It attaches:
    1. Supplier Info (Verified Badge)
    2. Ratings
    3. Views
-   4. ⭐ NEW: Discount Label (Flash Sale Badge)
+   4. Discount Label (Flash Sale Badge)
    ========================================================================== */
 const constructProductCards = async (rawProducts) => {
     if (!rawProducts || rawProducts.length === 0) return [];
@@ -88,9 +88,9 @@ const constructProductCards = async (rawProducts) => {
     const productIds = rawProducts.map(p => p.id);
     const supplierIds = [...new Set(rawProducts.map(p => p.supplier_id).filter(Boolean))];
     
-    // Safety check to prevent SQL errors
-    const sIdsSafe = supplierIds.length ? supplierIds : [0];
-    const pIdsSafe = productIds.length ? productIds : [0];
+    // Safety check to prevent SQL errors if arrays are empty
+    const sIdsSafe = supplierIds.length > 0 ? supplierIds : [0];
+    const pIdsSafe = productIds.length > 0 ? productIds :[0];
 
     try {
         // 2. Fetch All "Side Data" in Parallel (Fast)
@@ -105,10 +105,9 @@ const constructProductCards = async (rawProducts) => {
             viewsClient ? viewsClient.execute({ 
                 sql: `SELECT product_id, views FROM product_views WHERE product_id IN (${pIdsSafe.map(()=>'?').join(',')})`,
                 args: pIdsSafe 
-            }).catch(() => ({ rows: [] })) : { rows: [] },
+            }).catch(() => ({ rows: [] })) : Promise.resolve({ rows: [] }),
 
-            // D. 🔥 FETCH ACTIVE DISCOUNT BADGES (The New Logic) 🔥
-            // This gets the label (e.g., "Flash Sale") for the specific products loaded
+            // D. Fetch Active Discount Badges
             db.inventory.query(`
                 SELECT dp.product_id, d.name 
                 FROM discount_products dp 
@@ -118,33 +117,31 @@ const constructProductCards = async (rawProducts) => {
             `, [pIdsSafe]).catch(() => [[]])
         ]);
 
-        // 3. Create Lookup Maps (Using String Keys for Safety)
-        // We use String() to ensure ID 12 matches "12"
+        // 3. Create Lookup Maps (Using STRING Keys for Guaranteed Matching)
         const supplierMap = new Map(suppliersRes[0].map(s => [String(s.id), s]));
-        const ratingMap = new Map(ratingsRes[0].map(r => [r.product_id, r]));
-        const viewsMap = new Map(viewsRes.rows.map(v => [v.product_id, v.views]));
-        
-        // 🔥 Discount Map: ProductID -> Badge Name
+        const ratingMap = new Map(ratingsRes[0].map(r => [String(r.product_id), r]));
+        const viewsMap = new Map(viewsRes.rows.map(v =>[String(v.product_id), v.views]));
         const discountNameMap = new Map(discountRes[0].map(d => [String(d.product_id), d.name]));
 
-        // 4. Construct the Final Object for <ProductCard />
+        // 4. Construct the Final, Correct Object for <ProductCard />
         return rawProducts.map(p => {
             // -- Image Parsing --
             let image_urls = [];
             try { image_urls = typeof p.image_urls === 'string' ? JSON.parse(p.image_urls) : (p.image_urls || []); } 
             catch (e) { image_urls = p.image_url ? [p.image_url] : []; }
 
-            // -- Supplier Lookup --
+            // =============================================================
+            // 🔥 THE CRITICAL FIX IS HERE! 🔥
+            // We now look up data using String(p.id) to match the Map keys.
+            // This guarantees the review_count and views are attached correctly.
+            // =============================================================
             const sData = supplierMap.get(String(p.supplier_id));
-            const rData = ratingMap.get(p.id) || { avg_rating: 0, review_count: 0 };
+            const rData = ratingMap.get(String(p.id)) || { avg_rating: 0, review_count: 0 };
+            const viewCount = viewsMap.get(String(p.id)) || 0;
+            const discountLabel = discountNameMap.get(String(p.id)) || null;
 
             // -- Verified Badge Logic --
-            let isVerified = false;
-            let dbStatus = 'unverified'; 
-            if (sData && sData.verified_status) {
-                dbStatus = String(sData.verified_status).trim().toLowerCase();
-                if (['verified', 'true', '1'].includes(dbStatus)) isVerified = true;
-            }
+            const isVerified = sData && String(sData.verified_status).toLowerCase() === 'verified';
 
             // -- Video Check --
             const hasVideo = (p.video_url && p.video_url.length > 5) || image_urls.some(url => url && url.includes('.mp4'));
@@ -157,8 +154,7 @@ const constructProductCards = async (rawProducts) => {
                 price: parseFloat(p.price),
                 discounted_price: parseFloat(p.discounted_price || p.price),
                 
-                // 🔥 HERE IS THE MAGIC: Sends data to <ProductCard /> on ALL pages 🔥
-                discount_label: discountNameMap.get(String(p.id)) || null, 
+                discount_label: discountLabel,
 
                 image_urls: image_urls,
                 video_url: p.video_url,
@@ -169,27 +165,24 @@ const constructProductCards = async (rawProducts) => {
                 supplier_id: p.supplier_id,
                 supplier_verified: isVerified,
                 supplier: { 
-                    verified_status: dbStatus, 
+                    verified_status: isVerified ? 'verified' : 'unverified', 
                     city: sData ? sData.city : '',
                     brand_name: sData ? sData.brand_name : ''
                 },
-                supplier_city: sData ? sData.city : '',
-
-                // Stats
+                
+                // 🔥 CORRECT STATS ARE NOW ATTACHED 🔥
                 avg_rating: parseFloat(rData.avg_rating || 0),
-                review_count: rData.review_count || 0,
-                views: viewsMap.get(p.id) || 0,
-                product_ratings: [{ avg_rating: parseFloat(rData.avg_rating || 0), review_count: rData.review_count || 0 }]
+                review_count: parseInt(rData.review_count) || 0, // Ensure it's a number
+                views: parseInt(viewCount) || 0, // Ensure it's a number
             };
         });
 
     } catch (e) {
-        console.error("ConstructCard Error:", e);
+        console.error("ConstructCard CRITICAL Error:", e);
         // Fallback if DB fails
         return rawProducts.map(p => parseProduct(p));
     }
 };
-
 // ... existing getExploreFeed code ...
 
 /* ======================================================
