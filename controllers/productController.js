@@ -956,48 +956,41 @@ exports.getProductById = async (req, res) => {
 
 
 
-// Inside productController.js
-
 /* ======================================================
-   🔥 UPDATED 10/10 SITEMAP GENERATOR (With Images) 🔥
+   🔥 ULTIMATE SITEMAP GENERATOR (Images + Video) 🔥
    ====================================================== */
 exports.getSitemapUrls = async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 1000;
-    
-    // We fetch ALL products first to ensure sorting is correct across shards
     const offset = (page - 1) * limit;
 
-    // 🔥 CHANGED: Added 'image_urls' to the SELECT query
+    // 🔥 CHANGED: Added title, description, and video_url
+    // We limit description to 200 chars to keep the sitemap file size small
     const sql = `
-      SELECT slug, sku, created_at as lastmod, image_urls
+      SELECT title, slug, sku, created_at as lastmod, image_urls, video_url, LEFT(description, 200) as short_desc
       FROM products
     `;
 
     const clientValues = Object.values(clients).filter(Boolean);
 
-    // 1️⃣ Fetch all products from all shards
+    // 1. Fetch
     const promises = clientValues.map(client =>
-      client.execute({ sql }) // Note: removed args since we aren't filtering
+      client.execute({ sql })
         .then(r => r.rows || [])
         .catch(() => [])
     );
 
     const results = await Promise.all(promises);
-
-    // 2️⃣ Merge all products
     const allProducts = results.flat();
 
-    // 3️⃣ Sort by id (Critical for stable pagination)
-    // Note: If ID is UUID, sort by created_at or slug. If numeric, ID is fine.
-    // Assuming ID or created_at for stability:
+    // 2. Sort
     allProducts.sort((a, b) => {
         if (a.id && b.id) return a.id - b.id; 
         return 0; 
     });
 
-    // 4️⃣ Apply pagination AFTER merging
+    // 3. Paginate
     const paginatedProducts = allProducts.slice(offset, offset + limit);
 
     res.json({
@@ -1006,14 +999,10 @@ exports.getSitemapUrls = async (req, res) => {
     });
 
   } catch (e) {
-    console.error("Sitemap URL Generation Error:", e);
-    res.status(500).json({
-      products: [],
-      totalCount: 0
-    });
+    console.error("Sitemap Error:", e);
+    res.status(500).json({ products: [], totalCount: 0 });
   }
 };
-
 // Add this new function anywhere in productController.js
 
 /* ======================================================
