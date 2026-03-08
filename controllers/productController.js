@@ -72,96 +72,76 @@ const enrichWithSupplierDetails = async (products) => {
     }
 };
 /* ==========================================================================
-   🔥 GLOBAL CARD CONSTRUCTOR (THE DEFINITIVE FIX IS HERE) 🔥
-   
-   This function runs for Home, Explore, Category, and Search.
-   It attaches:
-   1. Supplier Info (Verified Badge)
-   2. Ratings
-   3. Views
-   4. Discount Label (Flash Sale Badge)
+   🔥 GLOBAL CARD CONSTRUCTOR (BULLETPROOF VERSION WITH DEBUGGING) 🔥
    ========================================================================== */
 const constructProductCards = async (rawProducts) => {
     if (!rawProducts || rawProducts.length === 0) return [];
 
-    // 1. Prepare IDs for Batch Fetching
     const productIds = rawProducts.map(p => p.id);
     const supplierIds = [...new Set(rawProducts.map(p => p.supplier_id).filter(Boolean))];
     
-    // Safety check to prevent SQL errors if arrays are empty
     const sIdsSafe = supplierIds.length > 0 ? supplierIds : [0];
-    const pIdsSafe = productIds.length > 0 ? productIds :[0];
+    const pIdsSafe = productIds.length > 0 ? productIds : [0];
 
     try {
-        // 2. Fetch All "Side Data" in Parallel (Fast)
         const [suppliersRes, ratingsRes, viewsRes, discountRes] = await Promise.all([
-            // A. Fetch Supplier Details (Verified Status)
-            db.suppliers.query(`SELECT id, verified_status, city, brand_name FROM suppliers WHERE id IN (?)`, [sIdsSafe]).catch(()=>[[]]),
+            db.suppliers.query(`SELECT id, verified_status, city, brand_name FROM suppliers WHERE id IN (?)`, [sIdsSafe])
+                .catch(e => { console.error('[DEBUG] Supplier query failed:', e.message); return [[]]; }),
             
-            // B. Fetch Ratings
-            db.reviews.query(`SELECT product_id, avg_rating, review_count FROM product_ratings WHERE product_id IN (?)`, [pIdsSafe]).catch(()=>[[]]),
+            db.reviews.query(`SELECT product_id, avg_rating, review_count FROM product_ratings WHERE product_id IN (?)`, [pIdsSafe])
+                .catch(e => { console.error('[DEBUG] Ratings query failed:', e.message); return [[]]; }),
             
-            // C. Fetch Views (Turso)
             viewsClient ? viewsClient.execute({ 
                 sql: `SELECT product_id, views FROM product_views WHERE product_id IN (${pIdsSafe.map(()=>'?').join(',')})`,
                 args: pIdsSafe 
-            }).catch(() => ({ rows: [] })) : Promise.resolve({ rows: [] }),
+            }).catch(e => { console.error('[DEBUG] Views query failed:', e.message); return { rows: [] }; }) : Promise.resolve({ rows: [] }),
 
-            // D. Fetch Active Discount Badges
-            db.inventory.query(`
-                SELECT dp.product_id, d.name 
-                FROM discount_products dp 
-                JOIN discounts d ON dp.discount_id = d.id 
-                WHERE d.is_active = 1 
-                AND dp.product_id IN (?)
-            `, [pIdsSafe]).catch(() => [[]])
+            db.inventory.query(`SELECT dp.product_id, d.name FROM discount_products dp JOIN discounts d ON dp.discount_id = d.id WHERE d.is_active = 1 AND dp.product_id IN (?)`, [pIdsSafe])
+                .catch(e => { console.error('[DEBUG] Discounts query failed:', e.message); return [[]]; })
         ]);
 
-        // 3. Create Lookup Maps (Using STRING Keys for Guaranteed Matching)
+        // =================================================================
+        //  DEBUG LOG 1: CHECK THE RAW DATABASE RESULTS
+        //  This will tell us if the database is returning any data at all.
+        // =================================================================
+        console.log('[DEBUG] Raw Ratings Result:', ratingsRes[0]);
+        console.log('[DEBUG] Raw Views Result:', viewsRes.rows);
+
         const supplierMap = new Map(suppliersRes[0].map(s => [String(s.id), s]));
         const ratingMap = new Map(ratingsRes[0].map(r => [String(r.product_id), r]));
         const viewsMap = new Map(viewsRes.rows.map(v =>[String(v.product_id), v.views]));
         const discountNameMap = new Map(discountRes[0].map(d => [String(d.product_id), d.name]));
 
-        // 4. Construct the Final, Correct Object for <ProductCard />
         return rawProducts.map(p => {
-            // -- Image Parsing --
             let image_urls = [];
             try { image_urls = typeof p.image_urls === 'string' ? JSON.parse(p.image_urls) : (p.image_urls || []); } 
             catch (e) { image_urls = p.image_url ? [p.image_url] : []; }
 
-            // =============================================================
-            // 🔥 THE CRITICAL FIX IS HERE! 🔥
-            // We now look up data using String(p.id) to match the Map keys.
-            // This guarantees the review_count and views are attached correctly.
-            // =============================================================
             const sData = supplierMap.get(String(p.supplier_id));
             const rData = ratingMap.get(String(p.id)) || { avg_rating: 0, review_count: 0 };
             const viewCount = viewsMap.get(String(p.id)) || 0;
-            const discountLabel = discountNameMap.get(String(p.id)) || null;
 
-            // -- Verified Badge Logic --
+            // =================================================================
+            //  DEBUG LOG 2: CHECK IF THE LOOKUP IS WORKING FOR EACH PRODUCT
+            // =================================================================
+            if (rData.review_count > 0 || viewCount > 0) {
+                console.log(`[DEBUG] Product ${p.id} has review data:`, rData, `and view count:`, viewCount);
+            }
+
             const isVerified = sData && String(sData.verified_status).toLowerCase() === 'verified';
-
-            // -- Video Check --
             const hasVideo = (p.video_url && p.video_url.length > 5) || image_urls.some(url => url && url.includes('.mp4'));
 
-            // -- The Final Data Object --
             return {
                 id: p.id,
                 title: p.title,
                 slug: p.slug,
                 price: parseFloat(p.price),
                 discounted_price: parseFloat(p.discounted_price || p.price),
-                
-                discount_label: discountLabel,
-
+                discount_label: discountNameMap.get(String(p.id)) || null,
                 image_urls: image_urls,
                 video_url: p.video_url,
                 has_video: hasVideo,
                 created_at: p.created_at,
-                
-                // Supplier Data
                 supplier_id: p.supplier_id,
                 supplier_verified: isVerified,
                 supplier: { 
@@ -169,17 +149,14 @@ const constructProductCards = async (rawProducts) => {
                     city: sData ? sData.city : '',
                     brand_name: sData ? sData.brand_name : ''
                 },
-                
-                // 🔥 CORRECT STATS ARE NOW ATTACHED 🔥
                 avg_rating: parseFloat(rData.avg_rating || 0),
-                review_count: parseInt(rData.review_count) || 0, // Ensure it's a number
-                views: parseInt(viewCount) || 0, // Ensure it's a number
+                review_count: parseInt(rData.review_count) || 0,
+                views: parseInt(viewCount) || 0,
             };
         });
 
     } catch (e) {
         console.error("ConstructCard CRITICAL Error:", e);
-        // Fallback if DB fails
         return rawProducts.map(p => parseProduct(p));
     }
 };
@@ -435,103 +412,81 @@ exports.getProductStats = async (req, res) => {
 };
 
 /* ======================================================
-   2. HOMEPAGE DATA (Controller Update) - TRULY POPULAR FIX
+   2. HOMEPAGE DATA (Controller Update)
    ====================================================== */
 exports.getHomepageData = async (req, res) => {
     try {
-        // 1. Fetch Basic Homepage Data (Banners & Categories)
-        const [bannersRes, catsRes] = await Promise.all([
-            db.inventory.query("SELECT id, image_url, link_url FROM banners WHERE is_active = 1").catch(() => [[ ]]),
-            db.inventory.query("SELECT id, name, image_url, slug, parent_id FROM categories ORDER BY name ASC").catch(() => [[ ]])
+        const[bannersRes, catsRes] = await Promise.all([
+            db.inventory.query("SELECT id, image_url, link_url FROM banners WHERE is_active = 1").catch(() => [[]]),
+            db.inventory.query("SELECT id, name, image_url, slug, parent_id FROM categories ORDER BY name ASC").catch(() => [[]])
         ]);
 
-        // 2. Fetch IDs for Promoted, Most Reviewed, and Most Viewed explicitly!
         const[promotedRows, topReviewedRows, topViewedRes] = await Promise.all([
-            db.inventory.query("SELECT product_id FROM promoted_products WHERE payment_status = 'paid' AND start_date <= NOW() AND end_date >= NOW() ORDER BY start_date DESC").catch(() => [[ ]]),
-            
-            // 🔥 FETCH ACTUAL MOST REVIEWED IDs FROM MYSQL
-            db.reviews.query("SELECT product_id FROM product_ratings ORDER BY review_count DESC, avg_rating DESC LIMIT 50").catch(() => [[ ]]),
-            
-            // 🔥 FETCH ACTUAL MOST VIEWED IDs FROM TURSO
-            viewsClient ? viewsClient.execute("SELECT product_id FROM product_views ORDER BY views DESC LIMIT 50").catch(() => ({ rows: [] })) : Promise.resolve({ rows:[] })
+            db.inventory.query("SELECT product_id FROM promoted_products WHERE payment_status = 'paid' AND start_date <= NOW() AND end_date >= NOW() ORDER BY start_date DESC").catch(() => [[]]),
+            db.reviews.query("SELECT product_id FROM product_ratings ORDER BY review_count DESC, avg_rating DESC LIMIT 50").catch(() =>[[]]),
+            viewsClient ? viewsClient.execute("SELECT product_id FROM product_views ORDER BY views DESC LIMIT 50").catch(() => ({rows:[]})) : Promise.resolve({rows:[]})
         ]);
 
-        // 3. Extract the IDs safely
         const promotedIds =[...new Set(promotedRows[0].map(r => String(r.product_id)))].slice(0, 50);
-        
-        // Combine Reviewed IDs and Viewed IDs into one "Popular" pool
         const popularIds = [...new Set([
             ...topReviewedRows[0].map(r => String(r.product_id)),
             ...topViewedRes.rows.map(r => String(r.product_id))
         ])].slice(0, 100);
 
-        // 4. Fetch the actual products from Turso using the specific IDs
-        // Also fetch the newest products directly for the Latest section
         const[promotedProductsRaw, popularProductsRaw, ...shardLatestResults] = await Promise.all([
             getProductsFromTursoByIds(promotedIds),
             getProductsFromTursoByIds(popularIds),
             ...Object.values(clients).map(c => c.execute("SELECT * FROM products WHERE status = 'in_stock' ORDER BY created_at DESC LIMIT 20").catch(() => ({ rows: [] })))
         ]);
 
-        // Flatten the latest products from all shards
         const rawLatest = shardLatestResults.map(res => res.rows).flat();
         
-        // 5. Enrich ALL products (Attaches reviews, views, images, and verified badges safely)
         const[promotedTop50, popularMixedRaw, enrichedLatest] = await Promise.all([
             constructProductCards(promotedProductsRaw),
             constructProductCards(popularProductsRaw),
             constructProductCards(rawLatest)
         ]);
+        
+        // =================================================================
+        //  DEBUG LOG 3: CHECK THE DATA JUST BEFORE SORTING
+        // =================================================================
+        console.log('[DEBUG] Data for Popular sorting:', JSON.stringify(popularMixedRaw.slice(0, 5), null, 2));
 
-        // 6. 🔥 Final Exact Sorting for Popular (1. Reviews -> 2. Views -> 3. Newest)
+
         const popularMixed = popularMixedRaw.sort((a, b) => {
-            const reviewsA = parseInt(a.review_count) || 0;
-            const reviewsB = parseInt(b.review_count) || 0;
-            if (reviewsB !== reviewsA) return reviewsB - reviewsA; // Most Reviews First
+            const reviewsA = a.review_count || 0;
+            const reviewsB = b.review_count || 0;
+            if (reviewsB !== reviewsA) return reviewsB - reviewsA;
             
-            const viewsA = parseInt(a.views) || 0;
-            const viewsB = parseInt(b.views) || 0;
-            if (viewsB !== viewsA) return viewsB - viewsA; // Then Most Views
+            const viewsA = a.views || 0;
+            const viewsB = b.views || 0;
+            if (viewsB !== viewsA) return viewsB - viewsA;
             
-            return new Date(b.created_at) - new Date(a.created_at); // Tie-breaker: Newest
+            return new Date(b.created_at) - new Date(a.created_at);
         });
 
-        // 7. 🔥 Final Exact Sorting for Latest (Strictly Absolute Newest)
         const latestProducts = enrichedLatest
             .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
-            .slice(0, 50); // Keep exactly top 50 newest
+            .slice(0, 50);
 
-        // 8. Format Categories (split into rows for the frontend)
         const subCategoriesAll = catsRes[0].filter(cat => cat.parent_id);
         const subCatRow1 = subCategoriesAll.slice(0, 16);
         const subCatRow2 = subCategoriesAll.slice(16, 32);
         const subCatRow3 = subCategoriesAll.slice(32, 48);
         
-        // Set Cache to make the homepage load instantly for users
         res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=30');
         
-        // 9. Send Final Response
         res.json({ 
             banners: bannersRes[0] ||[], 
-            subCatRow1, 
-            subCatRow2, 
-            subCatRow3, 
-            promotedTop50, 
-            popularMixed, 
-            latestProducts 
+            subCatRow1, subCatRow2, subCatRow3, 
+            promotedTop50, popularMixed, latestProducts 
         });
 
     } catch (error) {
         console.error("Homepage Error:", error);
-        // Fallback response if something fails, so the site doesn't crash
         res.status(500).json({ 
-            banners:[], 
-            subCatRow1: [], 
-            subCatRow2: [], 
-            subCatRow3:[], 
-            promotedTop50: [], 
-            popularMixed: [], 
-            latestProducts:[] 
+            banners:[], subCatRow1: [], subCatRow2: [], subCatRow3:[], 
+            promotedTop50: [], popularMixed: [], latestProducts:[] 
         });
     }
 };
