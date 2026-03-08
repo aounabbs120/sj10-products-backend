@@ -962,56 +962,51 @@ exports.getProductById = async (req, res) => {
    🔥 10/10 SITEMAP GENERATOR (No status filter) 🔥
    ====================================================== */
 exports.getSitemapUrls = async (req, res) => {
-    try {
-        const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 49000;
-        const offset = (page - 1) * limit;
+  try {
 
-        // REMOVED: "WHERE status = 'in_stock'" to include all products
-       const sql = `
-    SELECT slug, sku, created_at as lastmod 
-    FROM products 
-    LIMIT ? OFFSET ?
-`;
-        const countSql = `SELECT COUNT(id) as total FROM products`;
-        
-        const clientValues = Object.values(clients).filter(Boolean);
-        
-        const promises = clientValues.map(client => 
-            Promise.all([
-                client.execute({ sql, args: [limit, offset] }).then(r => r.rows || []),
-                // We only run count on page 1 for efficiency
-                page === 1 ? client.execute(countSql).then(r => r.rows[0]?.total || 0) : 0
-            ]).catch(() => [[], 0])
-        );
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 1000;
 
-        const results = await Promise.all(promises);
-         console.log("Database results from all shards:", results);
-        let allProducts = [];
-        let totalCount = 0;
-        results.forEach(([products, count]) => {
-            allProducts.push(...products);
-            totalCount += count;
-        });
+    const offset = (page - 1) * limit;
 
-        res.json({
-            products: allProducts,
-            // Only send totalCount if it was actually calculated on page 1
-            ...(page === 1 && { totalCount: totalCount })
-        });
+    const sql = `
+      SELECT slug, sku, created_at as lastmod
+      FROM products
+    `;
 
-    } catch (e) {
-    console.error("Sitemap URL Generation Error:", e);
-    // This will send the real database error message to your browser for debugging
-    res.status(500).json({
-        message: "Your backend had an error fetching sitemap URLs.",
-        error: e.message, 
-        products: [],
-        totalCount: 0
+    const clientValues = Object.values(clients).filter(Boolean);
+
+    // 1️⃣ Fetch all products from all shards
+    const promises = clientValues.map(client =>
+      client.execute(sql)
+        .then(r => r.rows || [])
+        .catch(() => [])
+    );
+
+    const results = await Promise.all(promises);
+
+    // 2️⃣ Merge all products
+    const allProducts = results.flat();
+
+    // 3️⃣ Sort by id (important for stable pagination)
+    allProducts.sort((a, b) => a.id - b.id);
+
+    // 4️⃣ Apply pagination AFTER merging
+    const paginatedProducts = allProducts.slice(offset, offset + limit);
+
+    res.json({
+      products: paginatedProducts,
+      totalCount: allProducts.length
     });
-}
-};
 
+  } catch (e) {
+    console.error("Sitemap URL Generation Error:", e);
+    res.status(500).json({
+      products: [],
+      totalCount: 0
+    });
+  }
+};
 
 // Add this new function anywhere in productController.js
 
