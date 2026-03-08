@@ -1030,9 +1030,8 @@ exports.getSitemapCount = async (req, res) => {
     }
 };
 
-
 /* ======================================================
-   🔥 GOOGLE SHOPPING FEED GENERATOR (Rich Data) 🔥
+   🔥 STABLE GOOGLE SHOPPING FEED (Crash-Proof Version) 🔥
    ====================================================== */
 exports.getGoogleShoppingProducts = async (req, res) => {
   try {
@@ -1040,54 +1039,65 @@ exports.getGoogleShoppingProducts = async (req, res) => {
     const limit = parseInt(req.query.limit) || 1000;
     const offset = (page - 1) * limit;
 
-    // 🔥 We need MORE data for Shopping Feed than Sitemap
+    // 1. Fetch only required columns from all shards
     const sql = `
-      SELECT id, title, slug, sku, description, price, discounted_price, image_urls, supplier_id
-      FROM products
+      SELECT id, title, slug, sku, description, price, discounted_price, image_urls 
+      FROM products 
       WHERE status = 'in_stock'
     `;
 
     const clientValues = Object.values(clients).filter(Boolean);
-
-    // 1. Fetch from all shards
-    const promises = clientValues.map(client =>
-      client.execute({ sql })
-        .then(r => r.rows || [])
-        .catch(() => [])
+    const promises = clientValues.map(client => 
+      client.execute({ sql }).then(r => r.rows || []).catch(() => [])
     );
 
     const results = await Promise.all(promises);
     const allProducts = results.flat();
 
-    // 2. Sort by ID for stability
+    // 2. SAFETY CHECK: If the requested page is beyond our data, stop here
+    if (offset >= allProducts.length) {
+        return res.json({ products: [], totalCount: allProducts.length });
+    }
+
+    // 3. ROBUST SORTING: Handle cases where ID might be missing or non-numeric
     allProducts.sort((a, b) => {
-        if (a.id && b.id) return a.id - b.id; 
-        return 0; 
+        const idA = parseInt(a.id) || 0;
+        const idB = parseInt(b.id) || 0;
+        return idA - idB;
     });
 
-    // 3. Paginate
+    // 4. PAGINATE IN MEMORY
     const paginatedProducts = allProducts.slice(offset, offset + limit);
 
-    // 4. Clean Data for XML
+    // 5. DEFENSIVE DATA CLEANING (One bad product won't crash the loop)
     const cleanProducts = paginatedProducts.map(p => {
-        // Parse Images
-        let image = "";
         try {
-            const parsed = typeof p.image_urls === 'string' ? JSON.parse(p.image_urls) : p.image_urls;
-            image = Array.isArray(parsed) ? parsed[0] : parsed;
-        } catch(e) { image = p.image_urls; }
+            // Parse Images safely
+            let image = "";
+            if (p.image_urls) {
+                if (typeof p.image_urls === 'string' && p.image_urls.startsWith('[')) {
+                    const parsed = JSON.parse(p.image_urls);
+                    image = parsed[0] || "";
+                } else {
+                    image = Array.isArray(p.image_urls) ? p.image_urls[0] : p.image_urls;
+                }
+            }
 
-        return {
-            id: p.sku || `SJ10-${p.id}`,
-            title: p.title,
-            description: p.description ? p.description.substring(0, 5000) : p.title, // Limit description
-            link: p.slug, // We will build full URL in frontend
-            image_link: image,
-            price: parseFloat(p.price),
-            sale_price: parseFloat(p.discounted_price || p.price),
-            brand: "SJ10" // Default brand (or map from supplier_id if you have that data loaded)
-        };
-    });
+            return {
+                id: p.sku || `SJ10-${p.id}`,
+                title: p.title || "No Title",
+                description: p.description ? String(p.description).substring(0, 1000) : "No description available",
+                link: p.slug || "",
+                image_link: image || "",
+                price: parseFloat(p.price) || 0,
+                sale_price: parseFloat(p.discounted_price || p.price) || 0,
+                brand: "SJ10"
+            };
+        } catch (itemError) {
+            console.error("Error processing single product:", p.id, itemError);
+            return null; // Skip this one bad product
+        }
+    }).filter(Boolean); // Remove any nulls from the array
 
     res.json({
       products: cleanProducts,
@@ -1095,11 +1105,11 @@ exports.getGoogleShoppingProducts = async (req, res) => {
     });
 
   } catch (e) {
-    console.error("Shopping Feed Error:", e);
-    res.status(500).json({ products: [] });
+    console.error("CRITICAL Shopping Feed Error:", e);
+    // Return empty array instead of crashing with 500
+    res.status(200).json({ products: [], totalCount: 0, error: "Internal processing error" });
   }
 };
-
 /* ======================================================
    🔥 GOOGLE SHOPPING MASTER FEED (1 LINK FOR EVERYTHING) 🔥
    ====================================================== */
