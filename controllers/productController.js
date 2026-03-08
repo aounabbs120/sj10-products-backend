@@ -446,47 +446,85 @@ exports.getProductStats = async (req, res) => {
    ====================================================== */
 exports.getHomepageData = async (req, res) => {
     try {
-        const [bannersRes, promotedRes, catsRes, ...shardResults] = await Promise.all([
+        // Fetch data from database
+        const[bannersRes, promotedRes, catsRes, ...shardResults] = await Promise.all([
             db.inventory.query("SELECT id, image_url, link_url FROM banners WHERE is_active = 1"),
-            // Fetch promoted products (ensure we have enough candidates)
             db.inventory.query("SELECT product_id FROM promoted_products WHERE payment_status = 'paid' AND start_date <= NOW() AND end_date >= NOW() ORDER BY start_date DESC"),
             db.inventory.query("SELECT id, name, image_url, slug, parent_id FROM categories ORDER BY name ASC"),
-            // Increased limit here to ensure we have enough for Popular section
-            ...Object.values(clients).map(c => c.execute("SELECT * FROM products WHERE status = 'in_stock' ORDER BY created_at DESC LIMIT 40"))
+            // Increased limit to 100 per shard to make sure we have a big enough pool for both Popular and Latest
+            ...Object.values(clients).map(c => c.execute("SELECT * FROM products WHERE status = 'in_stock' ORDER BY created_at DESC LIMIT 100"))
         ]);
 
         const [banners] = bannersRes;
-        const [promotedRows] = promotedRes;
+        const[promotedRows] = promotedRes;
         const [allCats] = catsRes;
 
-        // 1. Promoted: Limit to top 50
+        // 1. Promoted Products logic (Unchanged as requested)
         const promotedIds = new Set(promotedRows.map(r => r.product_id));
-        // Slice the IDs first to avoid fetching too much data if not needed
         const top50PromotedIds = [...promotedIds].slice(0, 50); 
         let promotedProductsFull = await getProductsFromTursoByIds(top50PromotedIds);
         const promotedTop50 = await constructProductCards(promotedProductsFull); 
 
-        // 2. Popular (Sharded): Limit to 100
+        // 2. Extract General Products (Products that are NOT promoted)
         let generalProducts = shardResults.map(res => res.rows).flat().filter(p => !promotedIds.has(p.id));
-        // CHANGED: Slice to 100 products as requested
-        const popularMixed = await constructProductCards(generalProducts.slice(0, 100)); 
+        
+        // Enrich ALL general products to get their reviews, views, and verified status
+        const enrichedGeneralProducts = await constructProductCards(generalProducts);
 
-        // 3. Cats Logic (unchanged)
+        // ==========================================================
+        // 🔥 FIX 1: POPULAR PRODUCTS (Reviews -> Views -> Newest)
+        // ==========================================================
+        const popularMixed = [...enrichedGeneralProducts]
+            .sort((a, b) => {
+                // Priority 1: Most Reviews
+                const reviewsA = a.review_count || 0;
+                const reviewsB = b.review_count || 0;
+                if (reviewsB !== reviewsA) return reviewsB - reviewsA; 
+                
+                // Priority 2: Most Views
+                const viewsA = a.views || 0;
+                const viewsB = b.views || 0;
+                if (viewsB !== viewsA) return viewsB - viewsA; 
+                
+                // Priority 3: Newest First
+                return new Date(b.created_at) - new Date(a.created_at); 
+            })
+            .slice(0, 100); // Keep max 100 popular products
+
+        // ==========================================================
+        // 🔥 FIX 2: LATEST PRODUCTS (Strictly Absolute Newest)
+        // ==========================================================
+        const latestProducts = [...enrichedGeneralProducts]
+            .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+            .slice(0, 50); // Exactly 50 of the newest products
+
+        // 3. Cats Logic (Unchanged)
         const subCategoriesAll = allCats.filter(cat => cat.parent_id);
         const subCatRow1 = subCategoriesAll.slice(0, 16);
         const subCatRow2 = subCategoriesAll.slice(16, 32);
         const subCatRow3 = subCategoriesAll.slice(32, 48);
         
         res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=30');
-        res.json({ banners: banners || [], subCatRow1, subCatRow2, subCatRow3, promotedTop50, popularMixed });
+        
+        // ✅ Send BOTH popularMixed AND latestProducts to the frontend
+        res.json({ 
+            banners: banners ||[], 
+            subCatRow1, 
+            subCatRow2, 
+            subCatRow3, 
+            promotedTop50, 
+            popularMixed, 
+            latestProducts 
+        });
 
     } catch (error) {
         console.error("Homepage Error:", error);
-        res.status(500).json({ banners: [], subCatRow1: [], subCatRow2: [], subCatRow3: [], promotedTop50: [], popularMixed: [] });
+        res.status(500).json({ 
+            banners: [], subCatRow1: [], subCatRow2: [], subCatRow3:[], 
+            promotedTop50: [], popularMixed: [], latestProducts:[] 
+        });
     }
 };
-
-
 
 
 exports.getHomepageCategories = async (req, res) => {
