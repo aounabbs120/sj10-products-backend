@@ -1031,7 +1031,7 @@ exports.getSitemapCount = async (req, res) => {
 };
 
 /* ======================================================
-   🔥 STABLE GOOGLE SHOPPING FEED (Crash-Proof Version) 🔥
+   🔥 BULLETPROOF GOOGLE SHOPPING FEED (Memory Safe) 🔥
    ====================================================== */
 exports.getGoogleShoppingProducts = async (req, res) => {
   try {
@@ -1039,54 +1039,60 @@ exports.getGoogleShoppingProducts = async (req, res) => {
     const limit = parseInt(req.query.limit) || 1000;
     const offset = (page - 1) * limit;
 
-    // 1. Fetch only required columns from all shards
-    const sql = `
-      SELECT id, title, slug, sku, description, price, discounted_price, image_urls 
-      FROM products 
-      WHERE status = 'in_stock'
-    `;
-
+    // --- STEP 1: Fetch ONLY IDs from all shards (Lightweight) ---
+    const idSql = `SELECT id FROM products WHERE status = 'in_stock'`;
     const clientValues = Object.values(clients).filter(Boolean);
-    const promises = clientValues.map(client => 
-      client.execute({ sql }).then(r => r.rows || []).catch(() => [])
+    
+    const idPromises = clientValues.map(client => 
+      client.execute({ sql: idSql }).then(r => r.rows.map(p => p.id)).catch(() => [])
     );
 
-    const results = await Promise.all(promises);
-    const allProducts = results.flat();
+    const idResults = await Promise.all(idPromises);
+    let allProductIds = idResults.flat();
 
-    // 2. SAFETY CHECK: If the requested page is beyond our data, stop here
-    if (offset >= allProducts.length) {
-        return res.json({ products: [], totalCount: allProducts.length });
+    // Sort the IDs. Assuming they are numeric.
+    allProductIds.sort((a, b) => (parseInt(a) || 0) - (parseInt(b) || 0));
+
+    // --- STEP 2: Slice the IDs to get the current page ---
+    const pageIds = allProductIds.slice(offset, offset + limit);
+
+    // If there are no IDs for this page, we're done.
+    if (pageIds.length === 0) {
+      return res.json({ products: [], totalCount: allProductIds.length });
     }
 
-    // 3. ROBUST SORTING: Handle cases where ID might be missing or non-numeric
-    allProducts.sort((a, b) => {
-        const idA = parseInt(a.id) || 0;
-        const idB = parseInt(b.id) || 0;
-        return idA - idB;
-    });
+    // --- STEP 3: Fetch FULL product data for ONLY this page's IDs ---
+    const productSql = `
+      SELECT id, title, slug, sku, description, price, discounted_price, image_urls
+      FROM products
+      WHERE id IN (${pageIds.map(() => '?').join(',')})
+    `;
 
-    // 4. PAGINATE IN MEMORY
-    const paginatedProducts = allProducts.slice(offset, offset + limit);
-
-    // 5. DEFENSIVE DATA CLEANING (One bad product won't crash the loop)
+    const productPromises = clientValues.map(client =>
+      client.execute({ sql: productSql, args: pageIds })
+        .then(r => r.rows || [])
+        .catch(() => [])
+    );
+    
+    const productResults = await Promise.all(productPromises);
+    const paginatedProducts = productResults.flat();
+    
+    // --- STEP 4: Clean and Return the Data (Defensive) ---
     const cleanProducts = paginatedProducts.map(p => {
+        // This part remains the same defensive cleaning logic
         try {
-            // Parse Images safely
             let image = "";
             if (p.image_urls) {
                 if (typeof p.image_urls === 'string' && p.image_urls.startsWith('[')) {
-                    const parsed = JSON.parse(p.image_urls);
-                    image = parsed[0] || "";
+                    image = JSON.parse(p.image_urls)[0] || "";
                 } else {
                     image = Array.isArray(p.image_urls) ? p.image_urls[0] : p.image_urls;
                 }
             }
-
             return {
                 id: p.sku || `SJ10-${p.id}`,
                 title: p.title || "No Title",
-                description: p.description ? String(p.description).substring(0, 1000) : "No description available",
+                description: p.description ? String(p.description).substring(0, 1000) : "No description",
                 link: p.slug || "",
                 image_link: image || "",
                 price: parseFloat(p.price) || 0,
@@ -1094,19 +1100,19 @@ exports.getGoogleShoppingProducts = async (req, res) => {
                 brand: "SJ10"
             };
         } catch (itemError) {
-            console.error("Error processing single product:", p.id, itemError);
-            return null; // Skip this one bad product
+            console.error("Error processing single product ID:", p.id, itemError);
+            return null;
         }
-    }).filter(Boolean); // Remove any nulls from the array
+    }).filter(Boolean);
 
     res.json({
       products: cleanProducts,
-      totalCount: allProducts.length
+      totalCount: allProductIds.length
     });
 
   } catch (e) {
     console.error("CRITICAL Shopping Feed Error:", e);
-    // Return empty array instead of crashing with 500
+    // Return empty array to prevent Next.js from crashing
     res.status(200).json({ products: [], totalCount: 0, error: "Internal processing error" });
   }
 };
