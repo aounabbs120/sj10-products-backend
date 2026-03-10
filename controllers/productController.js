@@ -163,7 +163,7 @@ const constructProductCards = async (rawProducts) => {
 // ... existing getExploreFeed code ...
 
 /* ======================================================
-   NEW: DEDICATED SEARCH RESULTS (Promoted First)
+   NEW: DEDICATED SEARCH RESULTS (Promoted First + Auto-Learning)
    ====================================================== */
 exports.getSearchResults = async (req, res) => {
     try {
@@ -172,15 +172,15 @@ exports.getSearchResults = async (req, res) => {
         const offset = (page - 1) * limit;
         const { q } = req.query; // Search term
 
-        if (!q) return res.json({ products: [], totalCount: 0 });
+        if (!q) return res.json({ products:[], totalCount: 0 });
 
         // 1. Fetch Promoted IDs
-        let promotedIds = [];
+        let promotedIds =[];
         try {
             const [pRows] = await db.inventory.query(
                 "SELECT product_id FROM promoted_products WHERE payment_status = 'paid' AND start_date <= NOW() AND end_date >= NOW()"
             );
-            promotedIds = pRows.map(r => r.product_id);
+            promotedIds = pRows.map(r => String(r.product_id));
         } catch (e) {}
 
         // 2. Search Query
@@ -194,14 +194,14 @@ exports.getSearchResults = async (req, res) => {
             try {
                 const res = await client.execute({ sql, args });
                 return res.rows;
-            } catch (e) { return []; }
+            } catch (e) { return[]; }
         });
 
         const results = await Promise.all(promises);
         let allProducts = results.flat();
 
         // 4. 🔥 SORTING MAGIC: Promoted First 🔥
-        const promotedSet = new Set(promotedIds.map(String)); // String for safe comparison
+        const promotedSet = new Set(promotedIds);
 
         allProducts.sort((a, b) => {
             const isAPromoted = promotedSet.has(String(a.id));
@@ -228,13 +228,37 @@ exports.getSearchResults = async (req, res) => {
             is_promoted: promotedSet.has(String(p.id))
         }));
 
+        // ==========================================================
+        // 🔥 THE MAGIC: AUTO-LEARN SUCCESSFUL SEARCHES 🔥
+        // ==========================================================
+        // Only save the keyword if:
+        // 1. It is the first page of search (page === 1)
+        // 2. We actually found products (totalCount > 0)
+        // 3. The keyword is at least 3 letters long (to avoid junk words)
+        if (page === 1 && totalCount > 0 && q.length >= 3) {
+            const safeKeyword = q.trim().toLowerCase();
+            
+            // We use a try/catch inside so it NEVER crashes the user's search
+            try {
+                // If keyword doesn't exist, insert it with count 1. 
+                // If it already exists, just increase the count by 1!
+                await db.inventory.query(`
+                    INSERT INTO search_keywords (keyword, search_count) 
+                    VALUES (?, 1) 
+                    ON DUPLICATE KEY UPDATE search_count = search_count + 1
+                `, [safeKeyword]);
+            } catch (learnError) {
+                console.error("Auto-Learn Error:", learnError.message);
+            }
+        }
+        // ==========================================================
+
+        // 8. Send the results back to the user
         res.json({ products: finalWithFlag, totalCount });
 
     } catch (e) {
         console.error("Search Error:", e);
-        res.status(500).json({ products: [], totalCount: 0 });
-    }
-};
+        res.status(500).json({ products:[], totalCount: 0 });
 /* ======================================================
    🔥 SUPER FAST TEXT SUGGESTIONS (Daraz Style) 🔥
    ====================================================== */
