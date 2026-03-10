@@ -259,6 +259,8 @@ exports.getSearchResults = async (req, res) => {
     } catch (e) {
         console.error("Search Error:", e);
         res.status(500).json({ products:[], totalCount: 0 });
+    }
+};
 /* ======================================================
    🔥 SUPER FAST TEXT SUGGESTIONS (Daraz Style) 🔥
    ====================================================== */
