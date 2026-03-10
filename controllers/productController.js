@@ -250,7 +250,7 @@ exports.getSearchSuggestionsText = async (req, res) => {
 
         // 2. Search ONLY the new 'search_keywords' table in MySQL
         // We order by 'search_count' DESC so the most popular searches show at the top!
-        const [rows] = await db.inventory.query(
+        const[rows] = await db.inventory.query(
             `SELECT id, keyword 
              FROM search_keywords 
              WHERE LOWER(keyword) LIKE ? 
@@ -259,21 +259,20 @@ exports.getSearchSuggestionsText = async (req, res) => {
             [searchTerm]
         );
 
-        // 3. Format the data EXACTLY how your Next.js SearchBar.tsx expects it
+        // 3. Format the data EXACTLY how your Next.js frontend expects it
         const suggestions = rows.map(row => ({
             id: row.id,
             title: row.keyword,  // Frontend expects 'title'
             slug: row.keyword    // Frontend redirects using this
         }));
 
-        // 4. Cache the result for 60 seconds. 
-        // If 100 people type "sho" in the same minute, the server instantly answers without hitting the database!
+        // 4. Cache the result for 60 seconds for extreme speed
         res.set('Cache-Control', 'public, s-maxage=60'); 
 
         res.json(suggestions);
     } catch(e) { 
         console.error("Fast Suggestions Error:", e);
-        res.json(  []);
+        res.json([]); 
     }
 };
 /* ======================================================
