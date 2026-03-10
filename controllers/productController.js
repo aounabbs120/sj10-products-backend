@@ -163,7 +163,7 @@ const constructProductCards = async (rawProducts) => {
 // ... existing getExploreFeed code ...
 
 /* ======================================================
-   NEW: DEDICATED SEARCH RESULTS (Promoted First + Auto-Learning)
+   🔥 SMART SEARCH RESULTS (with Relevance Scoring) 🔥
    ====================================================== */
 exports.getSearchResults = async (req, res) => {
     try {
@@ -172,10 +172,10 @@ exports.getSearchResults = async (req, res) => {
         const offset = (page - 1) * limit;
         const { q } = req.query; // Search term
 
-        if (!q) return res.json({ products:[], totalCount: 0 });
+        if (!q) return res.json({ products: [], totalCount: 0 });
 
-        // 1. Fetch Promoted IDs
-        let promotedIds =[];
+        // 1. Fetch Promoted IDs (this logic remains the same)
+        let promotedIds = [];
         try {
             const [pRows] = await db.inventory.query(
                 "SELECT product_id FROM promoted_products WHERE payment_status = 'paid' AND start_date <= NOW() AND end_date >= NOW()"
@@ -183,38 +183,70 @@ exports.getSearchResults = async (req, res) => {
             promotedIds = pRows.map(r => String(r.product_id));
         } catch (e) {}
 
-        // 2. Search Query
-        const term = `%${q.trim().toLowerCase()}%`;
-        const sql = `SELECT * FROM products WHERE status = 'in_stock' AND LOWER(title) LIKE ?`;
-        const args = [term];
+        // --- 2. THE SMART SEARCH BRAIN ---
+        // A. Remove useless words like 'for', 'and', 'in'
+        const stopWords = new Set(['for', 'and', 'in', 'a', 'the', 'with', 'of']);
+        const searchKeywords = q.trim().toLowerCase().split(/\s+/)
+            .filter(word => !stopWords.has(word) && word.length > 1);
 
-        // 3. Execute across shards
+        // If no valuable keywords are left, return empty
+        if (searchKeywords.length === 0) {
+            return res.json({ products: [], totalCount: 0 });
+        }
+
+        // B. Build the 'scoring' part of the SQL query
+        // For each keyword, we add a point if the title contains it.
+        const relevanceScoreSQL = searchKeywords.map(keyword => 
+            `(CASE WHEN LOWER(title) LIKE '%${keyword.replace(/'/g, "''")}%' THEN 1 ELSE 0 END)`
+        ).join(' + ');
+
+        // C. Build the 'WHERE' part of the SQL query
+        // It now finds products that match ANY of the keywords.
+        const whereClauses = searchKeywords.map(() => `LOWER(title) LIKE ?`).join(' OR ');
+        const whereArgs = searchKeywords.map(keyword => `%${keyword}%`);
+
+        // D. Build the final SQL query
+        const sql = `
+            SELECT *, (${relevanceScoreSQL}) as relevance_score 
+            FROM products 
+            WHERE status = 'in_stock' AND (${whereClauses})
+        `;
+        const args = [...whereArgs];
+
+        // 3. Execute across all shards
         const clientValues = Object.values(clients).filter(Boolean);
         const promises = clientValues.map(async (client) => {
             try {
                 const res = await client.execute({ sql, args });
                 return res.rows;
-            } catch (e) { return[]; }
+            } catch (e) { return []; }
         });
 
         const results = await Promise.all(promises);
         let allProducts = results.flat();
 
-        // 4. 🔥 SORTING MAGIC: Promoted First 🔥
+        // 4. 🔥 SORTING MAGIC: Promoted > Relevance Score > Newest 🔥
         const promotedSet = new Set(promotedIds);
 
         allProducts.sort((a, b) => {
             const isAPromoted = promotedSet.has(String(a.id));
             const isBPromoted = promotedSet.has(String(b.id));
 
-            // Logic: Promoted comes before Non-Promoted
+            // Priority 1: Promoted products always come first.
             if (isAPromoted && !isBPromoted) return -1;
             if (!isAPromoted && isBPromoted) return 1;
+
+            // Priority 2: Sort by the relevance score we created.
+            if (b.relevance_score !== a.relevance_score) {
+                return b.relevance_score - a.relevance_score;
+            }
             
-            // Tie-breaker: Newest First
+            // Priority 3 (Tie-breaker): If scores are equal, show the newest product first.
             return new Date(b.created_at) - new Date(a.created_at);
         });
 
+        // --- The rest of the function remains the same ---
+        
         // 5. Pagination (In-Memory)
         const totalCount = allProducts.length;
         const paginatedProducts = allProducts.slice(offset, offset + limit);
@@ -228,37 +260,24 @@ exports.getSearchResults = async (req, res) => {
             is_promoted: promotedSet.has(String(p.id))
         }));
 
-        // ==========================================================
-        // 🔥 THE MAGIC: AUTO-LEARN SUCCESSFUL SEARCHES 🔥
-        // ==========================================================
-        // Only save the keyword if:
-        // 1. It is the first page of search (page === 1)
-        // 2. We actually found products (totalCount > 0)
-        // 3. The keyword is at least 3 letters long (to avoid junk words)
+        // 8. Auto-Learn the search keyword if it found results
         if (page === 1 && totalCount > 0 && q.length >= 3) {
             const safeKeyword = q.trim().toLowerCase();
-            
-            // We use a try/catch inside so it NEVER crashes the user's search
             try {
-                // If keyword doesn't exist, insert it with count 1. 
-                // If it already exists, just increase the count by 1!
                 await db.inventory.query(`
-                    INSERT INTO search_keywords (keyword, search_count) 
-                    VALUES (?, 1) 
+                    INSERT INTO search_keywords (keyword, search_count) VALUES (?, 1) 
                     ON DUPLICATE KEY UPDATE search_count = search_count + 1
                 `, [safeKeyword]);
             } catch (learnError) {
                 console.error("Auto-Learn Error:", learnError.message);
             }
         }
-        // ==========================================================
 
-        // 8. Send the results back to the user
         res.json({ products: finalWithFlag, totalCount });
 
     } catch (e) {
         console.error("Search Error:", e);
-        res.status(500).json({ products:[], totalCount: 0 });
+        res.status(500).json({ products: [], totalCount: 0 });
     }
 };
 /* ======================================================
