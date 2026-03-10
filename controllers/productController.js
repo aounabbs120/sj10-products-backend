@@ -236,30 +236,44 @@ exports.getSearchResults = async (req, res) => {
     }
 };
 /* ======================================================
-   NEW: TEXT-ONLY SUGGESTIONS (Super Fast)
+   🔥 SUPER FAST TEXT SUGGESTIONS (Daraz Style) 🔥
    ====================================================== */
-// ✅ THIS FUNCTION MUST EXIST AND BE EXPORTED
 exports.getSearchSuggestionsText = async (req, res) => {
     try {
         const { q } = req.query;
+        
+        // If the user types less than 2 letters, don't search yet (saves server power)
         if(!q || q.length < 2) return res.json([]);
 
-        // Only select ID, title, and slug to make it lightweight
-        const sql = `SELECT id, title, slug FROM products WHERE status='in_stock' AND LOWER(title) LIKE ? LIMIT 3`;
-        const args = [`%${q.trim().toLowerCase()}%`];
+        // 1. Prepare the search term
+        const searchTerm = `%${q.trim().toLowerCase()}%`;
 
-        const promises = Object.values(clients).map(c => 
-            c.execute({ sql, args }).then(r => r.rows).catch(()=>[])
+        // 2. Search ONLY the new 'search_keywords' table in MySQL
+        // We order by 'search_count' DESC so the most popular searches show at the top!
+        const [rows] = await db.inventory.query(
+            `SELECT id, keyword 
+             FROM search_keywords 
+             WHERE LOWER(keyword) LIKE ? 
+             ORDER BY search_count DESC 
+             LIMIT 8`, 
+            [searchTerm]
         );
 
-        const results = await Promise.all(promises);
-        // Flatten results from all shards and limit to 6 total suggestions
-        const suggestions = results.flat().slice(0, 6);
+        // 3. Format the data EXACTLY how your Next.js SearchBar.tsx expects it
+        const suggestions = rows.map(row => ({
+            id: row.id,
+            title: row.keyword,  // Frontend expects 'title'
+            slug: row.keyword    // Frontend redirects using this
+        }));
+
+        // 4. Cache the result for 60 seconds. 
+        // If 100 people type "sho" in the same minute, the server instantly answers without hitting the database!
+        res.set('Cache-Control', 'public, s-maxage=60'); 
 
         res.json(suggestions);
     } catch(e) { 
-        console.error("Suggestions-Text Error:", e);
-        res.json([]); 
+        console.error("Fast Suggestions Error:", e);
+        res.json(  []);
     }
 };
 /* ======================================================
