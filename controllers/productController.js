@@ -72,7 +72,7 @@ const enrichWithSupplierDetails = async (products) => {
     }
 };
 /* ==========================================================================
-   🔥 GLOBAL CARD CONSTRUCTOR (BULLETPROOF VERSION WITH DEBUGGING) 🔥
+   🔥 GLOBAL CARD CONSTRUCTOR (UPDATED: Added SKU support)
    ========================================================================== */
 const constructProductCards = async (rawProducts) => {
     if (!rawProducts || rawProducts.length === 0) return [];
@@ -100,13 +100,6 @@ const constructProductCards = async (rawProducts) => {
                 .catch(e => { console.error('[DEBUG] Discounts query failed:', e.message); return [[]]; })
         ]);
 
-        // =================================================================
-        //  DEBUG LOG 1: CHECK THE RAW DATABASE RESULTS
-        //  This will tell us if the database is returning any data at all.
-        // =================================================================
-        console.log('[DEBUG] Raw Ratings Result:', ratingsRes[0]);
-        console.log('[DEBUG] Raw Views Result:', viewsRes.rows);
-
         const supplierMap = new Map(suppliersRes[0].map(s => [String(s.id), s]));
         const ratingMap = new Map(ratingsRes[0].map(r => [String(r.product_id), r]));
         const viewsMap = new Map(viewsRes.rows.map(v =>[String(v.product_id), v.views]));
@@ -121,13 +114,6 @@ const constructProductCards = async (rawProducts) => {
             const rData = ratingMap.get(String(p.id)) || { avg_rating: 0, review_count: 0 };
             const viewCount = viewsMap.get(String(p.id)) || 0;
 
-            // =================================================================
-            //  DEBUG LOG 2: CHECK IF THE LOOKUP IS WORKING FOR EACH PRODUCT
-            // =================================================================
-            if (rData.review_count > 0 || viewCount > 0) {
-                console.log(`[DEBUG] Product ${p.id} has review data:`, rData, `and view count:`, viewCount);
-            }
-
             const isVerified = sData && String(sData.verified_status).toLowerCase() === 'verified';
             const hasVideo = (p.video_url && p.video_url.length > 5) || image_urls.some(url => url && url.includes('.mp4'));
 
@@ -135,6 +121,7 @@ const constructProductCards = async (rawProducts) => {
                 id: p.id,
                 title: p.title,
                 slug: p.slug,
+                sku: p.sku, // <--- ✅ CRITICAL FIX: Pass SKU to frontend
                 price: parseFloat(p.price),
                 discounted_price: parseFloat(p.discounted_price || p.price),
                 discount_label: discountNameMap.get(String(p.id)) || null,
@@ -160,7 +147,6 @@ const constructProductCards = async (rawProducts) => {
         return rawProducts.map(p => parseProduct(p));
     }
 };
-// ... existing getExploreFeed code ...
 
 /* ======================================================
    🔥 SMART SEARCH RESULTS (with Relevance Scoring) 🔥
@@ -770,39 +756,32 @@ exports.getProductBySlug = async (req, res) => {
     }
 };
 /* ======================================================
-   3. CATEGORY ROWS (OPTIMIZED & FIXED)
+   3. CATEGORY ROWS (UPDATED: Selecting the SKU column)
    ====================================================== */
 exports.getCategoryRows = async (req, res) => {
     try {
-        // 1. Fetch ALL categories (Parents & Children) in ONE single query
         const [allCats] = await db.inventory.query(
             "SELECT id, name, slug, db_shard, parent_id FROM categories ORDER BY name ASC"
         );
 
-        // 2. Separate Parents and Children in Memory
-        // FIXED TYPO HERE: changed 'cB' to 'c'
         const parents = allCats.filter(c => !c.parent_id);
         const children = allCats.filter(c => c.parent_id); 
 
-        // 3. Create a Map for fast lookup of subcategories
         const childMap = new Map();
         children.forEach(c => {
             if (!childMap.has(c.parent_id)) childMap.set(c.parent_id, []);
             childMap.get(c.parent_id).push(c.id);
         });
 
-        // 4. Parallel execution for products
         const promises = parents.map(async p => {
             const client = clients[p.db_shard] || clients.shard_general;
-            
-            // Get subcategory IDs from our memory map
             const subIds = childMap.get(p.id) || [];
             const ids = [p.id, ...subIds].join(',');
 
             try {
-                // Select only specific columns to reduce data transfer size
+                // ✅ CRITICAL FIX: Added `sku` to the SELECT statement
                 const sql = `
-                    SELECT id, title, slug, price, discounted_price, 
+                    SELECT id, title, slug, sku, price, discounted_price, 
                            image_urls, video_url, supplier_id, created_at, 
                            category_id, views 
                     FROM products 
@@ -815,7 +794,6 @@ exports.getCategoryRows = async (req, res) => {
                 const res = await client.execute(sql);
                 
                 if(res.rows.length > 0) {
-                    // Enrich with Supplier Badges & Ratings
                     const enriched = await constructProductCards(res.rows);
                     return { category_id: p.id, category_name: p.name, category_slug: p.slug, products: enriched };
                 }
@@ -827,7 +805,6 @@ exports.getCategoryRows = async (req, res) => {
 
         const rows = (await Promise.all(promises)).filter(r => r);
 
-        // Set Aggressive Caching
         res.set('Cache-Control', 'public, s-maxage=1800, stale-while-revalidate=60');
         res.json(rows);
 
