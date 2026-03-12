@@ -1254,7 +1254,7 @@ exports.getGoogleShoppingMasterFeed = async (req, res) => {
 
 
 /* ======================================================
-   🔥 HIGH PERFORMANCE: FAST RELATED PRODUCTS (Limit 7)
+   🔥 HIGH PERFORMANCE: FAST RELATED PRODUCTS (Max 7)
    ====================================================== */
 exports.getFastRelatedProducts = async (req, res) => {
     try {
@@ -1269,9 +1269,10 @@ exports.getFastRelatedProducts = async (req, res) => {
         );
 
         const results = await Promise.all(promises);
+        // Flatten and strictly slice to max 7 items
         let products = results.flat().slice(0, parseInt(limit));
 
-        // Attach reviews & verified badges using your existing helper
+        // Attach reviews, ratings, and verified badges
         const enriched = await constructProductCards(products);
         
         res.set('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=60');
@@ -1283,7 +1284,7 @@ exports.getFastRelatedProducts = async (req, res) => {
 };
 
 /* ======================================================
-   🔥 HIGH PERFORMANCE: FAST SELLER PRODUCTS (Limit 7)
+   🔥 HIGH PERFORMANCE: FAST SELLER PRODUCTS (Max 7)
    ====================================================== */
 exports.getFastSellerProducts = async (req, res) => {
     try {
@@ -1298,6 +1299,7 @@ exports.getFastSellerProducts = async (req, res) => {
         );
 
         const results = await Promise.all(promises);
+        // Flatten and strictly slice to max 7 items
         let products = results.flat().slice(0, parseInt(limit));
 
         const enriched = await constructProductCards(products);
