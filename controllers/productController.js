@@ -1248,3 +1248,64 @@ exports.getGoogleShoppingMasterFeed = async (req, res) => {
     res.status(500).send("Error generating feed");
   }
 };
+
+
+
+
+
+/* ======================================================
+   🔥 HIGH PERFORMANCE: FAST RELATED PRODUCTS (Limit 7)
+   ====================================================== */
+exports.getFastRelatedProducts = async (req, res) => {
+    try {
+        const { category_id, current_id, limit = 7 } = req.query;
+        if (!category_id) return res.json({ products: [] });
+
+        const sql = `SELECT * FROM products WHERE category_id = ? AND id != ? AND status = 'in_stock' LIMIT ?`;
+        const args = [category_id, current_id || '0', parseInt(limit)];
+
+        const promises = Object.values(clients).filter(Boolean).map(client => 
+            client.execute({ sql, args }).then(r => r.rows).catch(() => [])
+        );
+
+        const results = await Promise.all(promises);
+        let products = results.flat().slice(0, parseInt(limit));
+
+        // Attach reviews & verified badges using your existing helper
+        const enriched = await constructProductCards(products);
+        
+        res.set('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=60');
+        res.json({ products: enriched });
+    } catch(e) {
+        console.error("Fast Related Error:", e);
+        res.status(500).json({ products: [] });
+    }
+};
+
+/* ======================================================
+   🔥 HIGH PERFORMANCE: FAST SELLER PRODUCTS (Limit 7)
+   ====================================================== */
+exports.getFastSellerProducts = async (req, res) => {
+    try {
+        const { supplierId, current_id, limit = 7 } = req.query;
+        if (!supplierId) return res.json({ products: [] });
+
+        const sql = `SELECT * FROM products WHERE supplier_id = ? AND id != ? AND status = 'in_stock' LIMIT ?`;
+        const args = [supplierId, current_id || '0', parseInt(limit)];
+
+        const promises = Object.values(clients).filter(Boolean).map(client => 
+            client.execute({ sql, args }).then(r => r.rows).catch(() => [])
+        );
+
+        const results = await Promise.all(promises);
+        let products = results.flat().slice(0, parseInt(limit));
+
+        const enriched = await constructProductCards(products);
+        
+        res.set('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=60');
+        res.json({ products: enriched });
+    } catch(e) {
+        console.error("Fast Seller Error:", e);
+        res.status(500).json({ products: [] });
+    }
+};
