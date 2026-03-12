@@ -6,8 +6,6 @@ const authenticateUser = require('../middleware/authenticateUser');
 
 // --- HOMEPAGE & STATIC DATA ---
 // Add near the top of the file
-router.get('/fast-related', productController.getFastRelatedProducts);
-router.get('/fast-seller', productController.getFastSellerProducts);
 router.get('/google-shopping-master.xml', productController.getGoogleShoppingMasterFeed);
 router.get('/sitemap-count', productController.getSitemapCount);
 router.get('/shopping-feed', productController.getGoogleShoppingProducts);
