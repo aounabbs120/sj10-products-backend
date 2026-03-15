@@ -41,16 +41,12 @@ console.log(`--- [Turso Connection] Total clients created: ${Object.keys(clients
 
 // 2. VIEWS ENGINE CLIENT
 const viewsClient = createClient({
-    url: process.env.TURSO_VIEWS_URL,
-    authToken: process.env.TURSO_VIEWS_TOKEN
+    url: process.env.TURSO_VIEWS_URL || "libsql://placeholder",
+    authToken: process.env.TURSO_VIEWS_TOKEN || "placeholder"
 });
-const mapClient = createClient({
-    url: process.env.TURSO_MAP_URL,
-    authToken: process.env.TURSO_MAP_TOKEN
-});
-console.log("✅ [Turso] Client created for: Slug-to-Shard Map");
+
 const getDbForCategory = (shardKey) => {
   return clients[shardKey] || clients.shard_general;
 };
 
-module.exports = { clients, viewsClient, mapClient, getDbForCategory }; 
+module.exports = { clients, viewsClient, getDbForCategory };
