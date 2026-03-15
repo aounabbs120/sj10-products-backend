@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { clients, viewsClient } = require('../config/tursoConnection');
+const { clients, viewsClient, mapClient } = require('../config/tursoConnection');
 const db = require('../config/database');
 
 // --- HELPER: Parse Product ---
@@ -596,9 +596,9 @@ exports.getSearchSuggestions = async (req, res) => {
 };
 
 /* ======================================================
-   🔥 FULLY UPDATED: GET PRODUCT BY SLUG 🔥
-   - Fixes View Count (Fetches from Turso Views Table)
-   - Fixes Favorites Count (Counts rows in MySQL Social DB)
+   🔥 FULLY UPDATED: GET PRODUCT BY SLUG (MAP DB INTEGRATED) 🔥
+   - Uses Map DB to eliminate waterfall/parallel queries
+   - Fixes View Count & Favorites Count
    - Handles "Smart Peel" for Slug matching
    ====================================================== */
 exports.getProductBySlug = async (req, res) => {
@@ -611,9 +611,8 @@ exports.getProductBySlug = async (req, res) => {
 
         const decodedParam = decodeURIComponent(rawParam).trim();
         const shardKeys = Object.keys(clients);
-        const lookupOps = [];
 
-        // --- STEP 2: SMART PEEL STRATEGY (Find the Product) ---
+        // --- STEP 2: SMART PEEL STRATEGY & MAP LOOKUP ---
         const candidates = new Set();
         candidates.add(decodedParam); 
 
@@ -626,34 +625,73 @@ exports.getProductBySlug = async (req, res) => {
             candidates.add(parts.slice(0, -1).join('-')); 
             if (parts.length > 2) candidates.add(parts.slice(0, -2).join('-'));
         }
+        const potentialSku = parts[parts.length - 1]; 
 
-        // Search all shards in parallel
-        shardKeys.forEach(key => {
-            const client = clients[key];
-            
-            // A. ID Match
-            if (extractedId) {
-                lookupOps.push(client.execute({ sql: "SELECT * FROM products WHERE id = ? LIMIT 1", args: [extractedId] }).then(r => r.rows.length ? { p: r.rows[0], key } : null).catch(() => null));
-            }
-            // B. Slug Match
-            candidates.forEach(slugCandidate => {
-                lookupOps.push(client.execute({ sql: "SELECT * FROM products WHERE slug = ? LIMIT 1", args: [slugCandidate] }).then(r => r.rows.length ? { p: r.rows[0], key } : null).catch(() => null));
-            });
-            // C. SKU Match (Last part)
-            const potentialSku = parts[parts.length - 1]; 
-            if (potentialSku) {
-                lookupOps.push(client.execute({ sql: "SELECT * FROM products WHERE sku = ? LIMIT 1", args: [potentialSku] }).then(r => r.rows.length ? { p: r.rows[0], key } : null).catch(() => null));
-            }
-        });
-
-        const results = await Promise.all(lookupOps);
-        
-        // Priority: ID > Slug > SKU
         let match = null;
-        if (extractedId) match = results.find(r => r && String(r.p.id) === String(extractedId));
+
+        // 🔥 MAP DATABASE LOOKUP: Find the exact shard in 1 fast query 🔥
+        if (mapClient) {
+            let mapConditions = [];
+            let mapArgs =[];
+
+            if (extractedId) { mapConditions.push("id = ?"); mapArgs.push(extractedId); }
+            candidates.forEach(c => { mapConditions.push("slug = ?"); mapArgs.push(c); });
+            if (potentialSku) { mapConditions.push("sku = ?"); mapArgs.push(potentialSku); }
+
+            if (mapConditions.length > 0) {
+                try {
+                    const mapSql = `SELECT id, slug, sku, shard_name FROM product_map WHERE ${mapConditions.join(' OR ')}`;
+                    const mapRes = await mapClient.execute({ sql: mapSql, args: mapArgs });
+
+                    if (mapRes.rows.length > 0) {
+                        // Priority: ID > Slug > SKU
+                        let bestMapMatch = null;
+                        if (extractedId) bestMapMatch = mapRes.rows.find(r => String(r.id) === String(extractedId));
+                        if (!bestMapMatch) bestMapMatch = mapRes.rows.find(r => candidates.has(r.slug));
+                        if (!bestMapMatch) bestMapMatch = mapRes.rows.find(r => String(r.sku) === String(potentialSku));
+                        if (!bestMapMatch) bestMapMatch = mapRes.rows[0];
+
+                        const targetShard = bestMapMatch.shard_name;
+                        const targetId = bestMapMatch.id;
+
+                        // Fetch the full product from the specific shard
+                        if (targetShard && clients[targetShard]) {
+                            const prodRes = await clients[targetShard].execute({ 
+                                sql: "SELECT * FROM products WHERE id = ? LIMIT 1", 
+                                args: [targetId] 
+                            });
+                            if (prodRes.rows.length > 0) {
+                                match = { p: prodRes.rows[0], key: targetShard };
+                            }
+                        }
+                    }
+                } catch (mapErr) {
+                    console.error("Map DB Lookup Failed:", mapErr.message);
+                }
+            }
+        }
+
+        // 🔥 FALLBACK: If Map DB fails (or product isn't synced yet), use Sequential Search
         if (!match) {
-            const validMatches = results.filter(r => r);
-            match = validMatches.find(r => candidates.has(r.p.slug)) || validMatches[0];
+            for (const key of shardKeys) {
+                const client = clients[key];
+                
+                if (extractedId) {
+                    const idRes = await client.execute({ sql: "SELECT * FROM products WHERE id = ? LIMIT 1", args: [extractedId] }).catch(()=>({rows:[]}));
+                    if (idRes.rows.length > 0) { match = { p: idRes.rows[0], key }; break; }
+                }
+                if (!match) {
+                    for (const slugCandidate of candidates) {
+                        const slugRes = await client.execute({ sql: "SELECT * FROM products WHERE slug = ? LIMIT 1", args: [slugCandidate] }).catch(()=>({rows:[]}));
+                        if (slugRes.rows.length > 0) { match = { p: slugRes.rows[0], key }; break; }
+                    }
+                    if (match) break;
+                }
+                if (!match && potentialSku) {
+                    const skuRes = await client.execute({ sql: "SELECT * FROM products WHERE sku = ? LIMIT 1", args: [potentialSku] }).catch(()=>({rows:[]}));
+                    if (skuRes.rows.length > 0) { match = { p: skuRes.rows[0], key }; break; }
+                }
+            }
         }
 
         if (!match) {
@@ -663,12 +701,11 @@ exports.getProductBySlug = async (req, res) => {
         const product = match.p;
 
         // --- STEP 3: PARALLEL DATA FETCHING (Views, Favs, Reviews, etc) ---
-        
         // A. Prepare View Count Promise (Turso)
         const viewCountPromise = viewsClient ? viewsClient.execute({
             sql: "SELECT views FROM product_views WHERE product_id = ?",
             args: [product.id]
-        }).catch(e => ({ rows: [] })) : Promise.resolve({ rows: [] });
+        }).catch(e => ({ rows:[] })) : Promise.resolve({ rows:[] });
 
         // B. Prepare Favorites Count Promise (MySQL)
         const favCountPromise = db.db_social ? db.db_social.query(
@@ -678,13 +715,13 @@ exports.getProductBySlug = async (req, res) => {
 
         // C. Fetch Everything
         const [
-            [sup],           // Supplier Info
-            [rev],           // Reviews
-            rel,             // Related Products
-            varRes,          // Variants
-            viewRes,         // Views Result
-            [favRes],        // Favorites Result
-            [promotedRes]    // Check if Promoted
+            [sup],           
+            [rev],           
+            rel,             
+            varRes,          
+            viewRes,         
+            [favRes],        
+            [promotedRes]    
         ] = await Promise.all([
             db.suppliers.query("SELECT id, brand_name as name, profile_pic, average_rating, followers_count, verified_status, total_products, city FROM suppliers WHERE id = ?", [product.supplier_id]),
             db.reviews.query("SELECT * FROM reviews WHERE product_id = ? ORDER BY created_at DESC LIMIT 5", [product.id]),
@@ -692,13 +729,13 @@ exports.getProductBySlug = async (req, res) => {
             clients[match.key].execute({ sql: "SELECT * FROM variants WHERE product_id = ?", args: [product.id] }),
             viewCountPromise,
             favCountPromise,
-            db.inventory.query("SELECT id FROM promoted_products WHERE product_id = ? AND payment_status='paid' AND end_date > NOW()", [product.id]).catch(()=>[[]])
+            db.inventory.query("SELECT id FROM promoted_products WHERE product_id = ? AND payment_status='paid' AND end_date > NOW()",[product.id]).catch(()=>[[]])
         ]);
 
         // --- STEP 4: DATA PROCESSING ---
 
         // Images
-        let image_urls = [];
+        let image_urls =[];
         try { image_urls = typeof product.image_urls === 'string' ? JSON.parse(product.image_urls) : product.image_urls; } catch (e) {}
 
         // Supplier
@@ -736,12 +773,12 @@ exports.getProductBySlug = async (req, res) => {
             
             // Related Items
             related_products: relatedEnriched,
-            variants: varRes.rows || [],
+            variants: varRes.rows ||[],
             
             // 🔥 CRITICAL STATS 🔥
-            views: realViews,          // Fetched from Turso
-            favorites: realFavorites,  // Fetched from MySQL
-            is_promoted: isPromoted,   // Fetched from MySQL
+            views: realViews,          
+            favorites: realFavorites,  
+            is_promoted: isPromoted,   
             
             // Helper for initial stats on frontend
             stats: {
