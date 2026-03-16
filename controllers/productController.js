@@ -628,7 +628,7 @@ exports.getProductBySlug = async (req, res) => {
         let match = null;
 
         // 🔥 MAP DATABASE LOOKUP: Find the exact shard in 1 fast query 🔥
-        if (mapClient) {
+        if (typeof mapClient !== 'undefined' && mapClient) {
             let mapConditions = [];
             let mapArgs =[];
 
@@ -674,7 +674,6 @@ exports.getProductBySlug = async (req, res) => {
 
         // 🔥 FALLBACK: If Map DB fails (or product isn't synced yet), use Sequential Search
         if (!match) {
-          
             for (const key of shardKeys) {
                 const client = clients[key];
                 
@@ -702,8 +701,8 @@ exports.getProductBySlug = async (req, res) => {
 
         const product = match.p;
 
-        // --- STEP 3: PARALLEL DATA FETCHING (Views, Favs, Reviews, etc) ---
-        const viewCountPromise = viewsClient ? viewsClient.execute({
+        // --- STEP 3: PARALLEL DATA FETCHING ---
+        const viewCountPromise = (typeof viewsClient !== 'undefined' && viewsClient) ? viewsClient.execute({
             sql: "SELECT views FROM product_views WHERE product_id = ?",
             args: [product.id]
         }).catch(e => ({ rows:[] })) : Promise.resolve({ rows:[] });
@@ -720,15 +719,27 @@ exports.getProductBySlug = async (req, res) => {
             varRes,          
             viewRes,         
             [favRes],        
-            [promotedRes]    
+            [promotedRes],
+            [catRes]         // ✅ NEW: Fetch Category Hierarchy for UI Breadcrumbs
         ] = await Promise.all([
             db.suppliers.query("SELECT id, brand_name as name, profile_pic, average_rating, followers_count, verified_status, total_products, city FROM suppliers WHERE id = ?", [product.supplier_id]),
             db.reviews.query("SELECT * FROM reviews WHERE product_id = ? ORDER BY created_at DESC LIMIT 5", [product.id]),
-            clients[match.key].execute({ sql: "SELECT * FROM products WHERE category_id = ? AND id != ? LIMIT 8", args: [product.category_id, product.id] }),
+            
+            // ✅ STRICT LIMIT 7 for Related Products 
+            clients[match.key].execute({ sql: "SELECT * FROM products WHERE category_id = ? AND id != ? LIMIT 7", args: [product.category_id, product.id] }),
+            
             clients[match.key].execute({ sql: "SELECT * FROM variants WHERE product_id = ?", args: [product.id] }),
             viewCountPromise,
             favCountPromise,
-            db.inventory.query("SELECT id FROM promoted_products WHERE product_id = ? AND payment_status='paid' AND end_date > NOW()", [product.id]).catch(()=>[[]])
+            db.inventory.query("SELECT id FROM promoted_products WHERE product_id = ? AND payment_status='paid' AND end_date > NOW()", [product.id]).catch(()=>[[]]),
+            
+            // ✅ Fetch category & parent category names
+            db.inventory.query(`
+                SELECT c1.name as sub_name, c1.slug as sub_slug, c2.name as parent_name, c2.slug as parent_slug 
+                FROM categories c1 
+                LEFT JOIN categories c2 ON c1.parent_id = c2.id 
+                WHERE c1.id = ?
+            `, [product.category_id]).catch(()=>[[{}]])
         ]);
 
         // --- STEP 4: DATA PROCESSING ---
@@ -740,8 +751,14 @@ exports.getProductBySlug = async (req, res) => {
 
         const realViews = viewRes.rows.length > 0 ? viewRes.rows[0].views : 0;
         const realFavorites = favRes[0]?.total || 0;
-        const relatedEnriched = await constructProductCards(rel.rows);
+        
+        let relatedEnriched = rel.rows;
+        if (typeof constructProductCards === 'function') {
+            relatedEnriched = await constructProductCards(rel.rows);
+        }
+
         const isPromoted = promotedRes.length > 0;
+        const categoryData = catRes[0] || {};
 
         // --- STEP 5: FINAL RESPONSE ---
         res.json({ 
@@ -755,6 +772,13 @@ exports.getProductBySlug = async (req, res) => {
                 verified_status: isVerified ? 'verified' : 'unverified',
                 is_verified: isVerified
             }, 
+            // ✅ Include category mapping for UI Breadcrumbs
+            category_info: {
+                name: categoryData.sub_name || "Category",
+                slug: categoryData.sub_slug || "all",
+                parent_name: categoryData.parent_name || null,
+                parent_slug: categoryData.parent_slug || null
+            },
             reviews: rev, 
             avg_rating: rev.length > 0 ? (rev.reduce((a, b) => a + parseFloat(b.rating), 0) / rev.length) : 0,
             related_products: relatedEnriched,
