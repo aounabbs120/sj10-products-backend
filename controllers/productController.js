@@ -596,10 +596,7 @@ exports.getSearchSuggestions = async (req, res) => {
 };
 
 /* ======================================================
-   🔥 FULLY UPDATED: GET PRODUCT BY SLUG (MAP DB INTEGRATED) 🔥
-   - Uses Map DB to eliminate waterfall/parallel queries
-   - Fixes View Count & Favorites Count
-   - Handles "Smart Peel" for Slug matching
+   🔥 ULTIMATE-PERFORMANCE: GET PRODUCT BY SLUG (MAP DB INTEGRATED) 🔥
    ====================================================== */
 exports.getProductBySlug = async (req, res) => {
     try {
@@ -609,6 +606,7 @@ exports.getProductBySlug = async (req, res) => {
             return res.status(400).json({ message: "Invalid Product Identifier" });
         }
 
+        // ✅ FIX: Kept the name exactly as decodedParam everywhere
         const decodedParam = decodeURIComponent(rawParam).trim();
         const shardKeys = Object.keys(clients);
 
@@ -640,6 +638,7 @@ exports.getProductBySlug = async (req, res) => {
 
             if (mapConditions.length > 0) {
                 try {
+                    console.log(`\n[TEST] 1. Searching for slug "${decodedParam}" in Map Database...`);
                     const mapSql = `SELECT id, slug, sku, shard_name FROM product_map WHERE ${mapConditions.join(' OR ')}`;
                     const mapRes = await mapClient.execute({ sql: mapSql, args: mapArgs });
 
@@ -653,6 +652,8 @@ exports.getProductBySlug = async (req, res) => {
 
                         const targetShard = bestMapMatch.shard_name;
                         const targetId = bestMapMatch.id;
+
+                        console.log(`[TEST] 2. ✅ Map Found! Shard is: ${targetShard}. Fetching from this shard only.`);
 
                         // Fetch the full product from the specific shard
                         if (targetShard && clients[targetShard]) {
@@ -673,6 +674,7 @@ exports.getProductBySlug = async (req, res) => {
 
         // 🔥 FALLBACK: If Map DB fails (or product isn't synced yet), use Sequential Search
         if (!match) {
+          
             for (const key of shardKeys) {
                 const client = clients[key];
                 
@@ -701,20 +703,17 @@ exports.getProductBySlug = async (req, res) => {
         const product = match.p;
 
         // --- STEP 3: PARALLEL DATA FETCHING (Views, Favs, Reviews, etc) ---
-        // A. Prepare View Count Promise (Turso)
         const viewCountPromise = viewsClient ? viewsClient.execute({
             sql: "SELECT views FROM product_views WHERE product_id = ?",
             args: [product.id]
         }).catch(e => ({ rows:[] })) : Promise.resolve({ rows:[] });
 
-        // B. Prepare Favorites Count Promise (MySQL)
         const favCountPromise = db.db_social ? db.db_social.query(
             "SELECT COUNT(*) as total FROM product_favorites WHERE product_id = ?",
             [product.id]
         ).catch(e => [[{ total: 0 }]]) : Promise.resolve([[{ total: 0 }]]);
 
-        // C. Fetch Everything
-        const [
+        const[
             [sup],           
             [rev],           
             rel,             
@@ -729,27 +728,19 @@ exports.getProductBySlug = async (req, res) => {
             clients[match.key].execute({ sql: "SELECT * FROM variants WHERE product_id = ?", args: [product.id] }),
             viewCountPromise,
             favCountPromise,
-            db.inventory.query("SELECT id FROM promoted_products WHERE product_id = ? AND payment_status='paid' AND end_date > NOW()",[product.id]).catch(()=>[[]])
+            db.inventory.query("SELECT id FROM promoted_products WHERE product_id = ? AND payment_status='paid' AND end_date > NOW()", [product.id]).catch(()=>[[]])
         ]);
 
         // --- STEP 4: DATA PROCESSING ---
-
-        // Images
         let image_urls =[];
         try { image_urls = typeof product.image_urls === 'string' ? JSON.parse(product.image_urls) : product.image_urls; } catch (e) {}
 
-        // Supplier
         const sData = sup[0] || {};
         const isVerified = ['verified', 'true', '1'].includes(String(sData.verified_status).toLowerCase());
 
-        // Counts
         const realViews = viewRes.rows.length > 0 ? viewRes.rows[0].views : 0;
         const realFavorites = favRes[0]?.total || 0;
-
-        // Enrich Related Products (Add badges/ratings to slider)
         const relatedEnriched = await constructProductCards(rel.rows);
-
-        // Check Promoted
         const isPromoted = promotedRes.length > 0;
 
         // --- STEP 5: FINAL RESPONSE ---
@@ -758,33 +749,20 @@ exports.getProductBySlug = async (req, res) => {
             image_urls,
             price: parseFloat(product.price),
             discounted_price: parseFloat(product.discounted_price || product.price),
-            
-            // Supplier Data
             supplier_verified: isVerified,
             supplier: { 
                 ...sData, 
                 verified_status: isVerified ? 'verified' : 'unverified',
                 is_verified: isVerified
             }, 
-            
-            // Reviews & Ratings
             reviews: rev, 
             avg_rating: rev.length > 0 ? (rev.reduce((a, b) => a + parseFloat(b.rating), 0) / rev.length) : 0,
-            
-            // Related Items
             related_products: relatedEnriched,
             variants: varRes.rows ||[],
-            
-            // 🔥 CRITICAL STATS 🔥
             views: realViews,          
             favorites: realFavorites,  
             is_promoted: isPromoted,   
-            
-            // Helper for initial stats on frontend
-            stats: {
-                views: realViews,
-                favorites: realFavorites
-            }
+            stats: { views: realViews, favorites: realFavorites }
         });
 
     } catch (e) { 

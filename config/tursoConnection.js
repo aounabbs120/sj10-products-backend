@@ -44,9 +44,15 @@ const viewsClient = createClient({
     url: process.env.TURSO_VIEWS_URL || "libsql://placeholder",
     authToken: process.env.TURSO_VIEWS_TOKEN || "placeholder"
 });
-
+const mapClient = createClient({
+    url: process.env.TURSO_MAP_URL || "libsql://placeholder-map",
+    authToken: process.env.TURSO_MAP_TOKEN || "placeholder-map"
+});
+console.log("✅ [Turso] Client created for: Slug-to-Shard Map");
 const getDbForCategory = (shardKey) => {
   return clients[shardKey] || clients.shard_general;
 };
+// At the end of the file, export the new mapClient
+module.exports = { clients, viewsClient, mapClient, getDbForCategory }; // Add mapClient here
 
-module.exports = { clients, viewsClient, getDbForCategory };
+
