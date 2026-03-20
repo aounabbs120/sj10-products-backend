@@ -1264,3 +1264,56 @@ exports.getGoogleShoppingMasterFeed = async (req, res) => {
     res.status(500).send("Error generating feed");
   }
 };
+
+/* ======================================================
+   🚀 REAL-TIME LATEST PRODUCTS (NO-CACHE)
+   Fetches the 40 most recent entries across all shards
+   ====================================================== */
+exports.getLatestProductsRealTime = async (req, res) => {
+    try {
+        const clientValues = Object.values(clients).filter(Boolean);
+
+        // 1. Query all shards in parallel for the 40 newest items each
+        const promises = clientValues.map(async (client) => {
+            try {
+                const sql = `
+                    SELECT id, title, slug, sku, price, discounted_price, 
+                           image_urls, video_url, supplier_id, created_at 
+                    FROM products 
+                    WHERE status = 'in_stock'
+                    ORDER BY created_at DESC 
+                    LIMIT 40
+                `;
+                const result = await client.execute(sql);
+                return result.rows || [];
+            } catch (e) {
+                console.error("Shard Fetch Error (Latest):", e.message);
+                return [];
+            }
+        });
+
+        const allShardResults = await Promise.all(promises);
+        
+        // 2. Flatten and Sort the combined results by date
+        const combinedProducts = allShardResults
+            .flat()
+            .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+            .slice(0, 40); // Keep exactly 40
+
+        // 3. Enrich with Supplier Badges and Ratings
+        // (Using your existing constructProductCards helper)
+        const finalProducts = await constructProductCards(combinedProducts);
+
+        // 4. CRUCIAL: Set Headers to bypass all caching
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+        res.setHeader('Surrogate-Control', 'no-store');
+
+        res.status(200).json(finalProducts);
+
+    } catch (error) {
+        console.error("Latest Products Real-Time Error:", error);
+        res.status(500).json({ message: "Failed to fetch fresh products" });
+    }
+};

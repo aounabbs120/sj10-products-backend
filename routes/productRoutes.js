@@ -15,6 +15,8 @@ router.get('/category-rows', productController.getCategoryRows);
 router.get('/categories-with-subcategories', productController.getCategoriesWithSubcategories);
 router.get('/active-timer', productController.getActivePromotionalTimer);
 router.get('/homepage-categories', productController.getHomepageCategories);
+// REAL-TIME ROUTES
+router.get('/latest-realtime', productController.getLatestProductsRealTime);
 
 // --- EXPLORE & SEARCH ---
 router.get('/explore-feed', productController.getExploreFeed);
