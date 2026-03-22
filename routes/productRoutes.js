@@ -16,6 +16,11 @@ router.get('/categories-with-subcategories', productController.getCategoriesWith
 router.get('/active-timer', productController.getActivePromotionalTimer);
 router.get('/homepage-categories', productController.getHomepageCategories);
 // REAL-TIME ROUTES
+// routes/productRoutes.js
+
+// New lightweight route for Product Cards (Daraz Style)
+// It handles shard-specific or global requests with strict pagination
+router.get('/feed-cards', productController.getProductCards);
 router.get('/latest-realtime', productController.getLatestProductsRealTime);
 
 // --- EXPLORE & SEARCH ---
