@@ -1335,7 +1335,7 @@ exports.getProductCards = async (req, res) => {
 
         // 2. LIGHTWEIGHT SQL QUERY 
         const sql = `
-            SELECT id, title, slug, sku, price, discounted_price, image_url, supplier_id 
+            SELECT id, title, slug, sku, price, discounted_price, image_url, supplier_id , video_url
             FROM products 
             WHERE status = 'in_stock'
             ORDER BY created_at DESC 
@@ -1405,7 +1405,8 @@ exports.getProductCards = async (req, res) => {
                 v: sInfo.isVerified,      
                 b: sInfo.brand,
                 r: rInfo.rating,     // ✅ Included Rating
-                rc: rInfo.count      // ✅ Included Review Count
+                rc: rInfo.count,
+                hv: !!p.video_url  // ✅ Included Video Indicator
             };
         });
 
