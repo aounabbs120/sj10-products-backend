@@ -1319,10 +1319,8 @@ exports.getLatestProductsRealTime = async (req, res) => {
 };
 
 
-// controllers/productController.js
-
 /**
- * 🔥 LIGHTWEIGHT PRODUCT CARDS API
+ * 🔥 LIGHTWEIGHT PRODUCT CARDS API (Updated with Reviews)
  * Optimized for: Low Quota Usage, High Speed, and CDN Caching
  */
 exports.getProductCards = async (req, res) => {
@@ -1332,12 +1330,10 @@ exports.getProductCards = async (req, res) => {
         const limit = 50; 
         const offset = (page - 1) * limit;
         
-        // Determine Shard: Default to general or allow specific shard selection
         const shardKey = req.query.shard || 'shard_general';
         const client = clients[shardKey] || clients.shard_general;
 
         // 2. LIGHTWEIGHT SQL QUERY 
-        // Only fetch columns needed for the card. Uses image_url (thumbnail)
         const sql = `
             SELECT id, title, slug, sku, price, discounted_price, image_url, supplier_id 
             FROM products 
@@ -1354,10 +1350,14 @@ exports.getProductCards = async (req, res) => {
             return res.json({ products: [], hasMore: false });
         }
 
-        // 3. ATTACH SUPPLIER VERIFICATION (MySQL Query)
+        // 3. ATTACH SUPPLIER VERIFICATION & RATINGS (MySQL Query)
+        const productIds = rawProducts.map(p => p.id);
         const supplierIds = [...new Set(rawProducts.map(p => p.supplier_id).filter(Boolean))];
         
         let supplierMap = new Map();
+        let ratingsMap = new Map();
+
+        // Fetch Suppliers
         if (supplierIds.length > 0) {
             const [suppliers] = await db.suppliers.query(
                 "SELECT id, verified_status, brand_name FROM suppliers WHERE id IN (?)",
@@ -1371,27 +1371,46 @@ exports.getProductCards = async (req, res) => {
             });
         }
 
+        // Fetch Ratings
+        if (productIds.length > 0 && db.reviews) {
+            try {
+                const [ratings] = await db.reviews.query(
+                    "SELECT product_id, avg_rating, review_count FROM product_ratings WHERE product_id IN (?)",
+                    [productIds]
+                );
+                ratings.forEach(r => {
+                    ratingsMap.set(String(r.product_id), {
+                        rating: parseFloat(r.avg_rating),
+                        count: parseInt(r.review_count)
+                    });
+                });
+            } catch (e) {
+                console.error("Ratings fetch failed for feed-cards", e);
+            }
+        }
+
         // 4. FORMAT RESPONSE
         const optimizedProducts = rawProducts.map(p => {
             const sInfo = supplierMap.get(String(p.supplier_id)) || { isVerified: false, brand: 'Unknown' };
+            const rInfo = ratingsMap.get(String(p.id)) || { rating: 0, count: 0 };
+
             return {
                 id: p.id,
-                t: p.title,               // Minified key for transport speed
+                t: p.title,               
                 s: p.slug,
                 sku: p.sku,
                 p: parseFloat(p.price),
                 dp: parseFloat(p.discounted_price || p.price),
-                img: p.image_url,         // Using single thumbnail field
-                v: sInfo.isVerified,      // Verification Status
-                b: sInfo.brand            // Supplier Brand
+                img: p.image_url,         
+                v: sInfo.isVerified,      
+                b: sInfo.brand,
+                r: rInfo.rating,     // ✅ Included Rating
+                rc: rInfo.count      // ✅ Included Review Count
             };
         });
 
-        // 5. CACHING HEADERS (The Quota Saver)
-        // Browser cache: 1 Hour
-        // Cloudflare/Vercel Edge Cache: 1 Day (s-maxage)
-        // Serve stale data for 1 hour while revalidating in background
-        res.set('Cache-Control', 'public, max-age=3600, s-maxage=86400, stale-while-revalidate=3600');
+        // 5. CACHING HEADERS (Cloudflare Edge Cache for 10 Days)
+        res.set('Cache-Control', 'public, max-age=3600, s-maxage=864000, stale-while-revalidate=86400');
 
         res.json({
             products: optimizedProducts,
