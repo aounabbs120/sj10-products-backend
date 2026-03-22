@@ -1320,22 +1320,21 @@ exports.getLatestProductsRealTime = async (req, res) => {
 
 
 /**
- * 🔥 LIGHTWEIGHT PRODUCT CARDS API (Updated with Reviews)
+ * 🔥 LIGHTWEIGHT PRODUCT CARDS API
  * Optimized for: Low Quota Usage, High Speed, and CDN Caching
  */
 exports.getProductCards = async (req, res) => {
     try {
-        // 1. STRICT PAGINATION (Force 50 items per page)
         const page = parseInt(req.query.page) || 1;
-        const limit = 50; 
+        const limit = parseInt(req.query.limit) || 40; 
         const offset = (page - 1) * limit;
         
         const shardKey = req.query.shard || 'shard_general';
         const client = clients[shardKey] || clients.shard_general;
 
-        // 2. LIGHTWEIGHT SQL QUERY 
+        // Fetching image_urls and video_url to detect videos correctly
         const sql = `
-            SELECT id, title, slug, sku, price, discounted_price, image_url, supplier_id , video_url
+            SELECT id, title, slug, sku, price, discounted_price, image_url, image_urls, video_url, supplier_id 
             FROM products 
             WHERE status = 'in_stock'
             ORDER BY created_at DESC 
@@ -1350,14 +1349,13 @@ exports.getProductCards = async (req, res) => {
             return res.json({ products: [], hasMore: false });
         }
 
-        // 3. ATTACH SUPPLIER VERIFICATION & RATINGS (MySQL Query)
         const productIds = rawProducts.map(p => p.id);
         const supplierIds = [...new Set(rawProducts.map(p => p.supplier_id).filter(Boolean))];
         
         let supplierMap = new Map();
         let ratingsMap = new Map();
 
-        // Fetch Suppliers
+        // 1. Get Verification Status
         if (supplierIds.length > 0) {
             const [suppliers] = await db.suppliers.query(
                 "SELECT id, verified_status, brand_name FROM suppliers WHERE id IN (?)",
@@ -1371,7 +1369,7 @@ exports.getProductCards = async (req, res) => {
             });
         }
 
-        // Fetch Ratings
+        // 2. Get Organic Reviews
         if (productIds.length > 0 && db.reviews) {
             try {
                 const [ratings] = await db.reviews.query(
@@ -1384,15 +1382,28 @@ exports.getProductCards = async (req, res) => {
                         count: parseInt(r.review_count)
                     });
                 });
-            } catch (e) {
-                console.error("Ratings fetch failed for feed-cards", e);
-            }
+            } catch (e) { console.error(e); }
         }
 
-        // 4. FORMAT RESPONSE
+        // 3. Format to Lite Object
         const optimizedProducts = rawProducts.map(p => {
             const sInfo = supplierMap.get(String(p.supplier_id)) || { isVerified: false, brand: 'Unknown' };
             const rInfo = ratingsMap.get(String(p.id)) || { rating: 0, count: 0 };
+
+            // Determine correct image and video status
+            let finalImg = p.image_url;
+            let hasVideo = false;
+
+            try {
+                const parsedImgs = typeof p.image_urls === 'string' ? JSON.parse(p.image_urls) : p.image_urls;
+                if (Array.isArray(parsedImgs) && parsedImgs.length > 0) {
+                    finalImg = parsedImgs[0];
+                }
+            } catch(e) {}
+
+            if ((p.video_url && p.video_url.length > 5) || (typeof p.image_urls === 'string' && p.image_urls.includes('.mp4'))) {
+                hasVideo = true;
+            }
 
             return {
                 id: p.id,
@@ -1401,16 +1412,16 @@ exports.getProductCards = async (req, res) => {
                 sku: p.sku,
                 p: parseFloat(p.price),
                 dp: parseFloat(p.discounted_price || p.price),
-                img: p.image_url,         
+                img: finalImg,         
                 v: sInfo.isVerified,      
                 b: sInfo.brand,
-                r: rInfo.rating,     // ✅ Included Rating
+                r: rInfo.rating,     
                 rc: rInfo.count,
-                hv: !!p.video_url  // ✅ Included Video Indicator
+                hv: hasVideo // ✅ Passes video status directly from backend!
             };
         });
 
-        // 5. CACHING HEADERS (Cloudflare Edge Cache for 10 Days)
+        // Cache for 10 Days on Cloudflare
         res.set('Cache-Control', 'public, max-age=3600, s-maxage=864000, stale-while-revalidate=86400');
 
         res.json({
