@@ -1422,7 +1422,7 @@ exports.getProductCards = async (req, res) => {
         });
 
         // Cache for 10 Days on Cloudflare
-        res.set('Cache-Control', 'public, max-age=3600, s-maxage=864000, stale-while-revalidate=86400');
+               res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=432000, stale-while-revalidate=604800');
 
         res.json({
             products: optimizedProducts,
