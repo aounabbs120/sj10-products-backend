@@ -412,7 +412,11 @@ exports.getExploreFeed = async (req, res) => {
 
         const paginatedProducts = finalProducts.slice(offset, offset + limit);
 
-        res.status(200).json({
+         // ✅ FIX: Set header FIRST
+        res.setHeader('Cache-Control', 'public, s-maxage=18000, stale-while-revalidate=1800');
+
+        // ✅ THEN send the JSON
+        return res.status(200).json({
             products: paginatedProducts,
             totalCount: shouldCount ? realTotalCount : undefined
         });
