@@ -28,7 +28,8 @@ router.get('/explore-feed', productController.getExploreFeed);
 router.get('/search-results', productController.getSearchResults);
 router.get('/suggestions-text', productController.getSearchSuggestionsText);
 router.get('/suggestions', productController.getSearchSuggestions);
-
+router.get('/popular', productController.getPopularProducts);
+router.get('/banners', productController.getBanners);
 // --- CATEGORY ---
 router.get('/category/:slug', productController.getProductsByCategorySlug);
 router.get('/:id/stats', productController.getProductStats);

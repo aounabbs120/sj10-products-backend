@@ -416,7 +416,7 @@ exports.getExploreFeed = async (req, res) => {
             products: paginatedProducts,
             totalCount: shouldCount ? realTotalCount : undefined
         });
-
+res.setHeader('Cache-Control', 'public, s-maxage=18000, stale-while-revalidate=1800');
     } catch (e) {
         console.error("Explore Error:", e);
         res.status(200).json({ products: [], totalCount: 0 });
@@ -854,7 +854,7 @@ exports.getCategoryRows = async (req, res) => {
 
         const rows = (await Promise.all(promises)).filter(r => r);
 
-        res.set('Cache-Control', 'public, s-maxage=1800, stale-while-revalidate=60');
+       res.setHeader('Cache-Control', 'public, s-maxage=43200, stale-while-revalidate=3600');
         res.json(rows);
 
     } catch (e) { 
@@ -1452,5 +1452,55 @@ exports.getProductCards = async (req, res) => {
     } catch (error) {
         console.error("Feed Cards Error:", error);
         res.status(500).json({ message: "Error fetching cards" });
+    }
+};
+
+
+// 1. Dedicated Banners API (12 Hours)
+exports.getBanners = async (req, res) => {
+    try {
+        const [banners] = await db.inventory.query("SELECT id, image_url, link_url FROM banners WHERE is_active = 1");
+        // 12 Hour Cache (43,200 seconds)
+        res.setHeader('Cache-Control', 'public, s-maxage=43200, stale-while-revalidate=3600');
+        res.json(banners);
+    } catch (e) { res.json([]); }
+};
+
+// 🔥 SMART POPULAR PRODUCTS API
+exports.getPopularProducts = async (req, res) => {
+    try {
+        // 1. Get IDs of the most reviewed products
+        const [reviewedRows] = await db.reviews.query(
+            "SELECT product_id FROM product_ratings WHERE review_count > 0 ORDER BY review_count DESC LIMIT 40"
+        );
+        let popularIds = reviewedRows.map(r => String(r.product_id));
+
+        // 2. Fallback: If we have less than 40, fill with Most Viewed
+        if (popularIds.length < 40) {
+            const remainingNeeded = 40 - popularIds.length;
+            const viewedRes = await viewsClient.execute({
+                sql: `SELECT product_id FROM product_views ORDER BY views DESC LIMIT 80`, 
+                args: []
+            });
+            
+            const viewedIds = viewedRes.rows.map(v => String(v.product_id));
+            
+            // Merge lists and remove duplicates
+            popularIds = [...new Set([...popularIds, ...viewedIds])].slice(0, 40);
+        }
+
+        // 3. Fetch full product data from Turso
+        const rawProducts = await getProductsFromTursoByIds(popularIds);
+        
+        // 4. Transform to Lite Product Cards
+        const finalProducts = await constructProductCards(rawProducts);
+
+        // 5. 🔥 CACHE FOR 2 HOURS (7,200 seconds)
+        res.setHeader('Cache-Control', 'public, s-maxage=7200, stale-while-revalidate=600');
+        res.json(finalProducts);
+
+    } catch (error) {
+        console.error("Popular Algorithm Error:", error);
+        res.status(200).json([]); // Return empty array so frontend doesn't crash
     }
 };
