@@ -579,6 +579,16 @@ exports.getCategoriesWithSubcategories = async (req, res) => {
         children.forEach(child => { if (parentMap.has(child.parent_id)) { parentMap.get(child.parent_id).subcategories.push(child); } });
         res.status(200).json({ mainCats: parents });
     } catch (error) { res.status(500).json({ mainCats: [] }); }
+       try {
+        // ... (your existing DB code) ...
+        
+        // 🔥 5-DAY CACHE for Category Structure
+        res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=432000, stale-while-revalidate=86400');
+        
+        res.status(200).json({ mainCats: parents });
+    } catch (error) { 
+        res.status(500).json({ mainCats: [] }); 
+    }
 };
 
 // ... Keep getSearchSuggestions, getProductBySlug, etc. unchanged below ...
@@ -964,6 +974,15 @@ exports.getProductsByCategorySlug = async (req, res) => {
 
     } catch (e) { 
         console.error("Error in Category Controller:", e);
+        res.status(500).json({message: "Server Error"}); 
+    }  try {
+        // ... (your existing DB code) ...
+
+        // 🔥 1-DAY CACHE for Category Product Lists (86,400 seconds)
+        res.setHeader('Cache-Control', 'public, max-age=600, s-maxage=86400, stale-while-revalidate=3600');
+
+        res.json({ category, products, total, totalPages, currentPage: page });
+    } catch (e) { 
         res.status(500).json({message: "Server Error"}); 
     }
 };
