@@ -866,9 +866,6 @@ exports.getCategoryRows = async (req, res) => {
         res.json([]); 
     }
 };
-/* ======================================================
-   FIXED: Get Products By Category (Removed invalid sort)
-   ====================================================== */
 exports.getProductsByCategorySlug = async (req, res) => {
     try {
         const { slug } = req.params;
@@ -876,10 +873,7 @@ exports.getProductsByCategorySlug = async (req, res) => {
         const limit = parseInt(req.query.limit) || 40;
         const offset = (page - 1) * limit;
         
-        // Filters
-        const sort = req.query.sort || 'default';
-        const search = req.query.search ? req.query.search.trim() : null;
-        const maxPrice = req.query.maxPrice ? parseFloat(req.query.maxPrice) : null;
+        const { sort = 'default', search, maxPrice, hasVideo, showVerified } = req.query;
 
         // 1. Get Category Info
         const [catRows] = await db.inventory.query("SELECT id, name, slug, db_shard FROM categories WHERE slug = ?", [slug]);
@@ -891,83 +885,55 @@ exports.getProductsByCategorySlug = async (req, res) => {
         const [children] = await db.inventory.query("SELECT id FROM categories WHERE parent_id = ?", [category.id]);
         const ids = [category.id, ...children.map(c => c.id)].join(',');
 
-        // 3. FETCH PROMOTED IDs (From MySQL)
-        let promotedIds = [];
-        try {
-            const [pRows] = await db.inventory.query(
-                "SELECT product_id FROM promoted_products WHERE payment_status = 'paid' AND start_date <= NOW() AND end_date >= NOW()"
-            );
-            promotedIds = pRows.map(r => String(r.product_id)); 
-        } catch (e) { console.error(e); }
-
-        // 4. Build SQL for Turso
+        // 3. Build SQL for Turso
         let sql = `SELECT * FROM products WHERE category_id IN (${ids}) AND status = 'in_stock'`;
         let countSql = `SELECT COUNT(*) as total FROM products WHERE category_id IN (${ids}) AND status = 'in_stock'`;
         let args = [];
 
-        // Search Logic
+        // 🔥 SEARCH FILTER
         if (search) {
             sql += ` AND LOWER(title) LIKE ?`;
             countSql += ` AND LOWER(title) LIKE ?`;
             args.push(`%${search.toLowerCase()}%`);
         }
-        // Price Logic
+
+        // 🔥 PRICE FILTER
         if (maxPrice) {
             sql += ` AND price <= ?`;
             countSql += ` AND price <= ?`;
-            args.push(maxPrice);
+            args.push(parseFloat(maxPrice));
         }
 
-        // 5. 🔥 SORTING LOGIC (FIXED) 🔥
-        // We calculate Promoted status here: 0 = Promoted, 1 = Not Promoted
-        let promotedFragment = "1"; 
-        if (promotedIds.length > 0) {
-            const idList = promotedIds.map(id => `'${id}'`).join(',');
-            promotedFragment = `CASE WHEN id IN (${idList}) THEN 0 ELSE 1 END`;
+        // 🔥 VIDEO FILTER (The Fix)
+        if (hasVideo === 'true') {
+            const videoClause = ` AND (video_url IS NOT NULL AND video_url != '' OR image_urls LIKE '%.mp4%')`;
+            sql += videoClause;
+            countSql += videoClause;
         }
 
-        // Apply Sort
-        if (sort === 'price_high') {
-            sql += ` ORDER BY price DESC`;
-        } else if (sort === 'price_low') {
-            sql += ` ORDER BY price ASC`;
-        } else {
-            // ❌ REMOVED: review_count DESC (Because it doesn't exist in Turso)
-            // ✅ ADDED: id DESC (as a fallback tie-breaker)
-            // Logic: Promoted First -> Then Newest -> Then by ID
-            sql += ` ORDER BY ${promotedFragment} ASC, created_at DESC`;
-        }
+        // 4. SORTING
+        if (sort === 'price_high') sql += ` ORDER BY price DESC`;
+        else if (sort === 'price_low') sql += ` ORDER BY price ASC`;
+        else sql += ` ORDER BY created_at DESC`;
 
         sql += ` LIMIT ? OFFSET ?`;
-        args.push(limit, offset);
+        const queryArgs = [...args, limit, offset];
 
-        // 6. Execute Queries
+        // 5. Execute
         const [pRes, cRes] = await Promise.all([
-            client.execute({ sql, args }),
-            client.execute({ sql: countSql, args: args.slice(0, args.length - 2) })
+            client.execute({ sql, args: queryArgs }),
+            client.execute({ sql: countSql, args })
         ]);
 
-        // 7. Enrich Data (This puts the reviews back into the JSON response)
+        // 6. Enrich with Supplier Data & Badges
         let enrichedProducts = await constructProductCards(pRes.rows);
         
-        // Flag Promoted for Frontend UI
-        const promotedSet = new Set(promotedIds);
-        enrichedProducts = enrichedProducts.map(p => ({
-            ...p,
-            is_promoted: promotedSet.has(String(p.id))
-        }));
-
-        // 🔥 OPTIONAL: CLIENT-SIDE SORT FOR "MOST REVIEWED" 🔥
-        // If sorting by reviews is critical, we do it here on the current page of results
-        if (sort === 'popular' || sort === 'default') {
-            enrichedProducts.sort((a, b) => {
-                // 1. Promoted First
-                if (a.is_promoted !== b.is_promoted) return a.is_promoted ? -1 : 1;
-                // 2. Then Review Count (We have this data now from constructProductCards)
-                return (b.review_count || 0) - (a.review_count || 0);
-            });
+        // 🔥 VERIFIED FILTER (In-Memory because it's a cross-DB check)
+        if (showVerified === 'true') {
+            enrichedProducts = enrichedProducts.filter(p => p.supplier_verified === true);
         }
 
+        res.set('Cache-Control', 'public, s-maxage=86400'); // 1 Day Cache
         res.json({ 
             category, 
             products: enrichedProducts, 
@@ -977,16 +943,7 @@ exports.getProductsByCategorySlug = async (req, res) => {
         });
 
     } catch (e) { 
-        console.error("Error in Category Controller:", e);
-        res.status(500).json({message: "Server Error"}); 
-    }  try {
-        // ... (your existing DB code) ...
-
-        // 🔥 1-DAY CACHE for Category Product Lists (86,400 seconds)
-        res.setHeader('Cache-Control', 'public, max-age=600, s-maxage=86400, stale-while-revalidate=3600');
-
-        res.json({ category, products, total, totalPages, currentPage: page });
-    } catch (e) { 
+        console.error("Category Controller Error:", e);
         res.status(500).json({message: "Server Error"}); 
     }
 };
