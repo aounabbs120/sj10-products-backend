@@ -30,6 +30,7 @@ router.get('/suggestions-text', productController.getSearchSuggestionsText);
 router.get('/suggestions', productController.getSearchSuggestions);
 router.get('/popular', productController.getPopularProducts);
 router.get('/banners', productController.getBanners);
+router.get('/strip-banners', productController.getActiveStripBanners);
 // --- CATEGORY ---
 router.get('/category/:slug', productController.getProductsByCategorySlug);
 router.get('/:id/stats', productController.getProductStats);

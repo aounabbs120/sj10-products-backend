@@ -1465,3 +1465,21 @@ exports.getPopularProducts = async (req, res) => {
         res.status(200).json([]); // Return empty array so frontend doesn't crash
     }
 };
+
+
+exports.getActiveStripBanners = async (req, res) => {
+    try {
+        const [rows] = await db.inventory.query(
+            "SELECT video_url, redirect_link, device_type FROM strip_banners WHERE is_active = 1"
+        );
+
+        // 🔥 10-Day Edge Caching (864,000 seconds)
+        // This ensures Cloudflare serves the response instantly to the App and Web
+        res.setHeader('Cache-Control', 'public, s-maxage=864000, stale-while-revalidate=3600');
+        
+        res.status(200).json(rows);
+    } catch (error) {
+        console.error("Strip Banner Error:", error);
+        res.status(500).json({ message: "Error fetching banners" });
+    }
+};
