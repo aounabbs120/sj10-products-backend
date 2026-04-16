@@ -9,6 +9,8 @@ const supplierRoutes = require('../routes/supplierRoutes');
 const socialRoutes = require('../routes/socialRoutes');
 const uploadRoutes = require('../routes/uploadRoutes'); // <--- ADD THIS
 const internalRoutes = require('../routes/internalRoutes'); // 👈 IMPORT THIS
+const cjWorkerRoutes = require('../routes/cjWorkerRoutes'); 
+
 const app = express();
 
 // Middleware
@@ -22,6 +24,7 @@ app.use('/api/suppliers', supplierRoutes);
 app.use('/api/social', socialRoutes);
 app.use('/api/upload', uploadRoutes); // <--- ADD THIS
 app.use('/api/internal', internalRoutes); // 👈 MOUNT THIS
+app.use('/api/cj-worker', cjWorkerRoutes); 
 
 // Health Check
 app.get('/', (req, res) => {
