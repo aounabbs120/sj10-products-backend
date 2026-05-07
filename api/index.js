@@ -18,7 +18,8 @@ const app = express();
 
 // Ye safe list hai. Sirf in URLs se aane wali requests ko data milega.
 const allowedOrigins = [
-  'http://localhost:3000',    // Aapka Local PC (for development)
+  'http://localhost:3000', 
+  'http://localhost:3001',   // Aapka Local PC (for development)
   'https://www.sj10.pk',      // Aapki Live Website (with www)
   'https://sj10.pk'           // Aapki Live Website (without www)
 ];
