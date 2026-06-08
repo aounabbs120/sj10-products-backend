@@ -16,17 +16,49 @@ const parseProduct = (p) => {
     return p;
 };
 
-// --- HELPER: Get Products from Turso by IDs ---
+// --- HELPER: Smartly Get Products from Turso using Map DB ---
 const getProductsFromTursoByIds = async (ids) => {
     if (!ids || ids.length === 0) return [];
-    const shardKeys = Object.keys(clients);
-    const promises = shardKeys.map(key =>
-        clients[key].execute({ sql: `SELECT * FROM products WHERE id IN (${ids.map(()=>'?').join(',')})`, args: ids })
-            .then(res => res.rows)
-            .catch(() => [])
-    );
-    const results = await Promise.all(promises);
-    return results.flat();
+    
+    try {
+        // 1. Pehle Map DB se poocho ke ye IDs kis Shard mein hain (Sirf 1 Query)
+        const placeholders = ids.map(() => '?').join(',');
+        const mapRes = await mapClient.execute({
+            sql: `SELECT id, shard_name FROM product_map WHERE id IN (${placeholders})`,
+            args: ids
+        });
+
+        if (mapRes.rows.length === 0) return [];
+
+        // 2. IDs ko unke Shard ke hisaab se Group karo
+        const shardGroups = {};
+        mapRes.rows.forEach(row => {
+            if (!shardGroups[row.shard_name]) shardGroups[row.shard_name] = [];
+            shardGroups[row.shard_name].push(row.id);
+        });
+
+        // 3. Ab SIRF un shards pe query maaro jin mein ye products hain (Saves 80% Queries)
+        const promises = Object.keys(shardGroups).map(async (shardName) => {
+            const targetClient = clients[shardName];
+            if (!targetClient) return [];
+
+            const shardIds = shardGroups[shardName];
+            const ph = shardIds.map(() => '?').join(',');
+            
+            const res = await targetClient.execute({
+                sql: `SELECT * FROM products WHERE id IN (${ph})`,
+                args: shardIds
+            });
+            return res.rows;
+        });
+
+        const results = await Promise.all(promises);
+        return results.flat();
+
+    } catch (error) {
+        console.error("Map DB Error in getProductsFromTursoByIds:", error.message);
+        return []; // Fail safely
+    }
 };
 
 /* ======================================================
@@ -258,6 +290,9 @@ exports.getSearchResults = async (req, res) => {
                 console.error("Auto-Learn Error:", learnError.message);
             }
         }
+        // res.json({ products: finalWithFlag, totalCount }); se theek pehle ye line add karein:
+res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=2592000, stale-while-revalidate=86400');
+res.json({ products: finalWithFlag, totalCount });
 
         res.json({ products: finalWithFlag, totalCount });
 
@@ -412,15 +447,14 @@ exports.getExploreFeed = async (req, res) => {
 
         const paginatedProducts = finalProducts.slice(offset, offset + limit);
 
-         // ✅ FIX: Set header FIRST
-        res.setHeader('Cache-Control', 'public, s-maxage=18000, stale-while-revalidate=1800');
+      // ✅ FIX: Set header FIRST
+        res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=2592000, stale-while-revalidate=86400');
 
         // ✅ THEN send the JSON
         return res.status(200).json({
             products: paginatedProducts,
             totalCount: shouldCount ? realTotalCount : undefined
         });
-res.setHeader('Cache-Control', 'public, s-maxage=18000, stale-while-revalidate=1800');
     } catch (e) {
         console.error("Explore Error:", e);
         res.status(200).json({ products: [], totalCount: 0 });
@@ -522,7 +556,13 @@ exports.getHomepageData = async (req, res) => {
         const subCatRow2 = subCategoriesAll.slice(16, 32);
         const subCatRow3 = subCategoriesAll.slice(32, 48);
         
-        res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=30');
+        // Puraana 60 seconds wala hatae aur ye lagayein:
+res.set('Cache-Control', 'public, max-age=3600, s-maxage=2592000, stale-while-revalidate=86400');
+res.json({ 
+    banners: bannersRes[0] || [], 
+    subCatRow1, subCatRow2, subCatRow3, 
+    promotedTop50, popularMixed, latestProducts 
+});
         
         res.json({ 
             banners: bannersRes[0] ||[], 
@@ -587,7 +627,7 @@ exports.getCategoriesWithSubcategories = async (req, res) => {
         // ... (your existing DB code) ...
         
         // 🔥 5-DAY CACHE for Category Structure
-        res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=432000, stale-while-revalidate=86400');
+         res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=2592000, stale-while-revalidate=86400');
         
         res.status(200).json({ mainCats: parents });
     } catch (error) { 
@@ -1401,8 +1441,8 @@ exports.getProductCards = async (req, res) => {
             };
         });
 
-        // Cache for 10 Days on Cloudflare
-               res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=432000, stale-while-revalidate=604800');
+        // 🔥 THE ULTIMATE 1-MONTH CACHE HEADER 🔥
+        res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=2592000, stale-while-revalidate=86400');
 
         res.json({
             products: optimizedProducts,
