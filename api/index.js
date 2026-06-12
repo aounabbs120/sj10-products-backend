@@ -11,7 +11,6 @@ const supplierRoutes = require('../routes/supplierRoutes');
 const socialRoutes = require('../routes/socialRoutes');
 const uploadRoutes = require('../routes/uploadRoutes');
 const internalRoutes = require('../routes/internalRoutes');
-const cjWorkerRoutes = require('../routes/cjWorkerRoutes'); 
 
 const app = express();
 
@@ -141,7 +140,6 @@ app.use('/api/suppliers', supplierRoutes);
 app.use('/api/social', socialRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/internal', internalRoutes);
-app.use('/api/cj-worker', cjWorkerRoutes); 
 
 // Health Check
 app.get('/', (req, res) => {
