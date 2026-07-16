@@ -1,6 +1,7 @@
 require('dotenv').config();
-const { clients, viewsClient, mapClient } = require('../config/tursoConnection');
 const db = require('../config/database');
+const redis = require('../config/redis'); 
+const { viewsClient, clients } = require('../config/tursoConnection');
 
 // --- HELPER: Parse Product ---
 const parseProduct = (p) => {
@@ -16,48 +17,15 @@ const parseProduct = (p) => {
     return p;
 };
 
-// --- HELPER: Smartly Get Products from Turso using Map DB ---
-const getProductsFromTursoByIds = async (ids) => {
+const getProductsFromOracleByIds = async (ids) => {
     if (!ids || ids.length === 0) return [];
-    
     try {
-        // 1. Pehle Map DB se poocho ke ye IDs kis Shard mein hain (Sirf 1 Query)
-        const placeholders = ids.map(() => '?').join(',');
-        const mapRes = await mapClient.execute({
-            sql: `SELECT id, shard_name FROM product_map WHERE id IN (${placeholders})`,
-            args: ids
-        });
-
-        if (mapRes.rows.length === 0) return [];
-
-        // 2. IDs ko unke Shard ke hisaab se Group karo
-        const shardGroups = {};
-        mapRes.rows.forEach(row => {
-            if (!shardGroups[row.shard_name]) shardGroups[row.shard_name] = [];
-            shardGroups[row.shard_name].push(row.id);
-        });
-
-        // 3. Ab SIRF un shards pe query maaro jin mein ye products hain (Saves 80% Queries)
-        const promises = Object.keys(shardGroups).map(async (shardName) => {
-            const targetClient = clients[shardName];
-            if (!targetClient) return [];
-
-            const shardIds = shardGroups[shardName];
-            const ph = shardIds.map(() => '?').join(',');
-            
-            const res = await targetClient.execute({
-                sql: `SELECT * FROM products WHERE id IN (${ph})`,
-                args: shardIds
-            });
-            return res.rows;
-        });
-
-        const results = await Promise.all(promises);
-        return results.flat();
-
+        const placeholders = ids.map((_, i) => `$${i + 1}`).join(',');
+        const res = await db.oracle.query(`SELECT * FROM products WHERE id IN (${placeholders})`, ids);
+        return res.rows;
     } catch (error) {
-        console.error("Map DB Error in getProductsFromTursoByIds:", error.message);
-        return []; // Fail safely
+        console.error("Oracle Fetch Error:", error.message);
+        return [];
     }
 };
 
@@ -103,39 +71,29 @@ const enrichWithSupplierDetails = async (products) => {
         return products.map(parseProduct); // Fallback
     }
 };
-/* ==========================================================================
-   🔥 GLOBAL CARD CONSTRUCTOR (UPDATED: Added SKU support)
-   ========================================================================== */
 const constructProductCards = async (rawProducts) => {
     if (!rawProducts || rawProducts.length === 0) return [];
 
     const productIds = rawProducts.map(p => p.id);
     const supplierIds = [...new Set(rawProducts.map(p => p.supplier_id).filter(Boolean))];
     
-    const sIdsSafe = supplierIds.length > 0 ? supplierIds : [0];
-    const pIdsSafe = productIds.length > 0 ? productIds : [0];
+    const sIdsSafe = supplierIds.length > 0 ? supplierIds : ['0'];
+    const pIdsSafe = productIds.length > 0 ? productIds : ['0'];
 
     try {
-        const [suppliersRes, ratingsRes, viewsRes, discountRes] = await Promise.all([
-            db.suppliers.query(`SELECT id, verified_status, city, brand_name FROM suppliers WHERE id IN (?)`, [sIdsSafe])
-                .catch(e => { console.error('[DEBUG] Supplier query failed:', e.message); return [[]]; }),
-            
-            db.reviews.query(`SELECT product_id, avg_rating, review_count FROM product_ratings WHERE product_id IN (?)`, [pIdsSafe])
-                .catch(e => { console.error('[DEBUG] Ratings query failed:', e.message); return [[]]; }),
-            
-            viewsClient ? viewsClient.execute({ 
-                sql: `SELECT product_id, views FROM product_views WHERE product_id IN (${pIdsSafe.map(()=>'?').join(',')})`,
-                args: pIdsSafe 
-            }).catch(e => { console.error('[DEBUG] Views query failed:', e.message); return { rows: [] }; }) : Promise.resolve({ rows: [] }),
+        // 1. Redis se saara current view buffer aik hi dafa uthao (For Speed)
+        const viewBuffer = await redis.hGetAll('product_views_buffer') || {};
 
-            db.inventory.query(`SELECT dp.product_id, d.name FROM discount_products dp JOIN discounts d ON dp.discount_id = d.id WHERE d.is_active = 1 AND dp.product_id IN (?)`, [pIdsSafe])
-                .catch(e => { console.error('[DEBUG] Discounts query failed:', e.message); return [[]]; })
+        // 2. TiDB MySQL Queries
+        const [suppliersRes, ratingsRes, discountRes] = await Promise.all([
+            db.suppliers.query(`SELECT id, verified_status, city, brand_name FROM suppliers WHERE id IN (?)`, [sIdsSafe]).catch(() => [[ ]]),
+            db.reviews.query(`SELECT product_id, avg_rating, review_count FROM product_ratings WHERE product_id IN (?)`, [pIdsSafe]).catch(() => [[ ]]),
+            db.inventory.query(`SELECT dp.product_id, d.name FROM discount_products dp JOIN discounts d ON dp.discount_id = d.id WHERE d.is_active = 1 AND dp.product_id IN (?)`, [pIdsSafe]).catch(() => [[ ]])
         ]);
 
-        const supplierMap = new Map(suppliersRes[0].map(s => [String(s.id), s]));
-        const ratingMap = new Map(ratingsRes[0].map(r => [String(r.product_id), r]));
-        const viewsMap = new Map(viewsRes.rows.map(v =>[String(v.product_id), v.views]));
-        const discountNameMap = new Map(discountRes[0].map(d => [String(d.product_id), d.name]));
+        const supplierMap = new Map((suppliersRes[0] || []).map(s => [String(s.id), s]));
+        const ratingMap = new Map((ratingsRes[0] || []).map(r => [String(r.product_id), r]));
+        const discountNameMap = new Map((discountRes[0] || []).map(d => [String(d.product_id), d.name]));
 
         return rawProducts.map(p => {
             let image_urls = [];
@@ -144,179 +102,125 @@ const constructProductCards = async (rawProducts) => {
 
             const sData = supplierMap.get(String(p.supplier_id));
             const rData = ratingMap.get(String(p.id)) || { avg_rating: 0, review_count: 0 };
-            const viewCount = viewsMap.get(String(p.id)) || 0;
+            
+            // 🚨 Real-time Views calculation (Oracle DB + Redis Buffer)
+            const dbViews = parseInt(p.views || 0);
+            const bufferViews = parseInt(viewBuffer[String(p.id)] || 0);
 
             const isVerified = sData && String(sData.verified_status).toLowerCase() === 'verified';
-            const hasVideo = (p.video_url && p.video_url.length > 5) || image_urls.some(url => url && url.includes('.mp4'));
+            const hasVideo = (p.video_url && p.video_url.length > 5) || (typeof p.image_urls === 'string' && p.image_urls.includes('.mp4'));
 
             return {
                 id: p.id,
                 title: p.title,
                 slug: p.slug,
-                sku: p.sku, // <--- ✅ CRITICAL FIX: Pass SKU to frontend
-                price: parseFloat(p.price),
-                discounted_price: parseFloat(p.discounted_price || p.price),
+                sku: p.sku || 'N/A',
+                price: parseFloat(p.price || 0),
+                discounted_price: parseFloat(p.discounted_price || p.price || 0),
                 discount_label: discountNameMap.get(String(p.id)) || null,
                 image_urls: image_urls,
-                video_url: p.video_url,
+                video_url: p.video_url || null,
                 has_video: hasVideo,
-                created_at: p.created_at,
-                supplier_id: p.supplier_id,
                 supplier_verified: isVerified,
                 supplier: { 
                     verified_status: isVerified ? 'verified' : 'unverified', 
                     city: sData ? sData.city : '',
-                    brand_name: sData ? sData.brand_name : ''
+                    brand_name: sData ? sData.brand_name : 'SJ10 Official'
                 },
                 avg_rating: parseFloat(rData.avg_rating || 0),
                 review_count: parseInt(rData.review_count) || 0,
-                views: parseInt(viewCount) || 0,
+                views: dbViews + bufferViews, // <--- Dono ko plus kar diya
             };
         });
-
     } catch (e) {
-        console.error("ConstructCard CRITICAL Error:", e);
-        return rawProducts.map(p => parseProduct(p));
+        console.error("🔴 ConstructCard Error:", e.message);
+        return rawProducts.map(parseProduct);
     }
 };
-
 /* ======================================================
-   🔥 SMART SEARCH RESULTS (with Relevance Scoring) 🔥
+   🔥 SMART SEARCH RESULTS (ORACLE POSTGRES)
+   Priority: SKU Match > Title Match > Description
    ====================================================== */
 exports.getSearchResults = async (req, res) => {
     try {
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 30;
         const offset = (page - 1) * limit;
-        const { q } = req.query; // Search term
+        const { q } = req.query;
 
         if (!q) return res.json({ products: [], totalCount: 0 });
 
-        // 1. Fetch Promoted IDs (this logic remains the same)
-        let promotedIds = [];
-        try {
-            const [pRows] = await db.inventory.query(
-                "SELECT product_id FROM promoted_products WHERE payment_status = 'paid' AND start_date <= NOW() AND end_date >= NOW()"
-            );
-            promotedIds = pRows.map(r => String(r.product_id));
-        } catch (e) {}
+        console.log(`🟢 [ORACLE DB] Main Search Request: "${q}"`);
 
-        // --- 2. THE SMART SEARCH BRAIN ---
-        // A. Remove useless words like 'for', 'and', 'in'
-        const stopWords = new Set(['for', 'and', 'in', 'a', 'the', 'with', 'of']);
-        const searchKeywords = q.trim().toLowerCase().split(/\s+/)
-            .filter(word => !stopWords.has(word) && word.length > 1);
+        // 1. Fetch Promoted IDs from TiDB (MySQL)
+        const [pRows] = await db.inventory.query(
+            "SELECT product_id FROM promoted_products WHERE payment_status = 'paid' AND start_date <= NOW() AND end_date >= NOW()"
+        );
+        const promotedIds = new Set(pRows.map(r => String(r.product_id)));
 
-        // If no valuable keywords are left, return empty
-        if (searchKeywords.length === 0) {
-            return res.json({ products: [], totalCount: 0 });
-        }
-
-        // B. Build the 'scoring' part of the SQL query
-        // For each keyword, we add a point if the title contains it.
-        const relevanceScoreSQL = searchKeywords.map(keyword => 
-            `(CASE WHEN LOWER(title) LIKE '%${keyword.replace(/'/g, "''")}%' THEN 1 ELSE 0 END)`
-        ).join(' + ');
-
-        // C. Build the 'WHERE' part of the SQL query
-        // It now finds products that match ANY of the keywords.
-        const whereClauses = searchKeywords.map(() => `LOWER(title) LIKE ?`).join(' OR ');
-        const whereArgs = searchKeywords.map(keyword => `%${keyword}%`);
-
-        // D. Build the final SQL query
-        const sql = `
-            SELECT *, (${relevanceScoreSQL}) as relevance_score 
-            FROM products 
-            WHERE status = 'in_stock' AND (${whereClauses})
-        `;
-        const args = [...whereArgs];
-
-        // 3. Execute across all shards
-        const clientValues = Object.values(clients).filter(Boolean);
-        const promises = clientValues.map(async (client) => {
-            try {
-                const res = await client.execute({ sql, args });
-                return res.rows;
-            } catch (e) { return []; }
-        });
-
-        const results = await Promise.all(promises);
-        let allProducts = results.flat();
-
-        // 4. 🔥 SORTING MAGIC: Promoted > Relevance Score > Newest 🔥
-        const promotedSet = new Set(promotedIds);
-
-        allProducts.sort((a, b) => {
-            const isAPromoted = promotedSet.has(String(a.id));
-            const isBPromoted = promotedSet.has(String(b.id));
-
-            // Priority 1: Promoted products always come first.
-            if (isAPromoted && !isBPromoted) return -1;
-            if (!isAPromoted && isBPromoted) return 1;
-
-            // Priority 2: Sort by the relevance score we created.
-            if (b.relevance_score !== a.relevance_score) {
-                return b.relevance_score - a.relevance_score;
-            }
-            
-            // Priority 3 (Tie-breaker): If scores are equal, show the newest product first.
-            return new Date(b.created_at) - new Date(a.created_at);
-        });
-
-        // --- The rest of the function remains the same ---
+        // 2. Build Smart Oracle (Postgres) Query
+        const searchPattern = `%${q.trim().toLowerCase()}%`;
         
-        // 5. Pagination (In-Memory)
-        const totalCount = allProducts.length;
-        const paginatedProducts = allProducts.slice(offset, offset + limit);
+        // Postgres Relevance logic: SKU matches are weighted higher than title
+        const sql = `
+            SELECT *, 
+            (CASE WHEN sku ILIKE $1 THEN 10 ELSE 0 END) + 
+            (CASE WHEN title ILIKE $1 THEN 5 ELSE 0 END) +
+            (CASE WHEN description ILIKE $1 THEN 1 ELSE 0 END) as relevance_score
+            FROM products 
+            WHERE status = 'in_stock' AND (title ILIKE $1 OR sku ILIKE $1 OR description ILIKE $1)
+            ORDER BY relevance_score DESC, created_at DESC
+            LIMIT $2 OFFSET $3
+        `;
 
-        // 6. Enrich Data (Images/Badges)
-        const finalProducts = await constructProductCards(paginatedProducts);
+        const [result, countRes] = await Promise.all([
+            db.oracle.query(sql, [searchPattern, limit, offset]),
+            db.oracle.query("SELECT COUNT(*) as total FROM products WHERE status = 'in_stock' AND (title ILIKE $1 OR sku ILIKE $1 OR description ILIKE $1)", [searchPattern])
+        ]);
 
-        // 7. Add 'is_promoted' flag for UI
-        const finalWithFlag = finalProducts.map(p => ({
+        // 3. Enrich Results (Badges, Ratings from construction helper)
+        const enrichedProducts = await constructProductCards(result.rows);
+
+        // 4. Mark Promoted Flag for Frontend
+        const finalWithFlag = enrichedProducts.map(p => ({
             ...p,
-            is_promoted: promotedSet.has(String(p.id))
+            is_promoted: promotedIds.has(String(p.id))
         }));
 
-        // 8. Auto-Learn the search keyword if it found results
-        if (page === 1 && totalCount > 0 && q.length >= 3) {
+        // 5. Auto-Learn Keyword (Track in TiDB MySQL)
+        if (page === 1 && finalWithFlag.length > 0) {
             const safeKeyword = q.trim().toLowerCase();
-            try {
-                await db.inventory.query(`
-                    INSERT INTO search_keywords (keyword, search_count) VALUES (?, 1) 
-                    ON DUPLICATE KEY UPDATE search_count = search_count + 1
-                `, [safeKeyword]);
-            } catch (learnError) {
-                console.error("Auto-Learn Error:", learnError.message);
-            }
+            db.inventory.query(`
+                INSERT INTO search_keywords (keyword, search_count) VALUES (?, 1) 
+                ON DUPLICATE KEY UPDATE search_count = search_count + 1
+            `, [safeKeyword]).catch(()=>{});
         }
-        // res.json({ products: finalWithFlag, totalCount }); se theek pehle ye line add karein:
-res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=2592000, stale-while-revalidate=86400');
-res.json({ products: finalWithFlag, totalCount });
 
-        res.json({ products: finalWithFlag, totalCount });
+        res.json({ 
+            products: finalWithFlag, 
+            totalCount: parseInt(countRes.rows[0].total || 0) 
+        });
 
     } catch (e) {
-        console.error("Search Error:", e);
+        console.error("🔴 Oracle Search Error:", e.message);
         res.status(500).json({ products: [], totalCount: 0 });
     }
 };
 /* ======================================================
-   🔥 SUPER FAST TEXT SUGGESTIONS (Daraz Style) 🔥
+   🔥 FAST TEXT SUGGESTIONS (TiDB MySQL)
+   Fetches from global search history
    ====================================================== */
 exports.getSearchSuggestionsText = async (req, res) => {
     try {
         const { q } = req.query;
-        
-        // If the user types less than 2 letters, don't search yet (saves server power)
         if(!q || q.length < 2) return res.json([]);
 
-        // 1. Prepare the search term
+        console.log(`🟡 [TiDB MySQL] Fetching Text Suggestions for: "${q}"`);
+
         const searchTerm = `%${q.trim().toLowerCase()}%`;
 
-        // 2. Search ONLY the new 'search_keywords' table in MySQL
-        // We order by 'search_count' DESC so the most popular searches show at the top!
-        const[rows] = await db.inventory.query(
+        // Search the global keywords table in TiDB
+        const [rows] = await db.inventory.query(
             `SELECT id, keyword 
              FROM search_keywords 
              WHERE LOWER(keyword) LIKE ? 
@@ -325,24 +229,23 @@ exports.getSearchSuggestionsText = async (req, res) => {
             [searchTerm]
         );
 
-        // 3. Format the data EXACTLY how your Next.js frontend expects it
         const suggestions = rows.map(row => ({
             id: row.id,
-            title: row.keyword,  // Frontend expects 'title'
-            slug: row.keyword    // Frontend redirects using this
+            title: row.keyword,
+            slug: row.keyword
         }));
 
-        // 4. Cache the result for 60 seconds for extreme speed
+        // Edge Caching for speed
         res.set('Cache-Control', 'public, s-maxage=60'); 
-
         res.json(suggestions);
+        
     } catch(e) { 
-        console.error("Fast Suggestions Error:", e);
+        console.error("🔴 TiDB Suggestions Error:", e.message);
         res.json([]); 
     }
 };
 /* ======================================================
-   🔥 UPDATED: EXPLORE FEED (Fixes 'More from Seller') 🔥
+   🔥 EXPLORE FEED (ORACLE DB)
    ====================================================== */
 exports.getExploreFeed = async (req, res) => {
     try {
@@ -350,238 +253,181 @@ exports.getExploreFeed = async (req, res) => {
         const limit = parseInt(req.query.limit) || 40;
         const offset = (page - 1) * limit;
         
-        // Destructure all possible filters
-        const { 
-            sort = 'default', 
-            hasVideo, 
-            showVerified, 
-            search, 
-            category_id, 
-            supplierId, // <--- ADDED THIS
-            rating, 
-            minPrice, 
-            maxPrice, 
-            city 
-        } = req.query;
+        const { sort = 'default', search, category_id, supplierId, minPrice, maxPrice } = req.query;
+
+        console.log(`🟢 [ORACLE DB] Fetching Explore Feed -> Page: ${page}`);
 
         let sql = `SELECT * FROM products WHERE status = 'in_stock'`;
         let countSql = `SELECT COUNT(*) as total FROM products WHERE status = 'in_stock'`;
         let args = [];
+        let paramIndex = 1; // Postgres uses $1, $2, $3
 
         // --- FILTER LOGIC ---
         if (search) { 
             const term = `%${search.trim().toLowerCase()}%`; 
-            sql += ` AND LOWER(title) LIKE ?`; 
-            countSql += ` AND LOWER(title) LIKE ?`; 
+            sql += ` AND LOWER(title) ILIKE $${paramIndex}`; 
+            countSql += ` AND LOWER(title) ILIKE $${paramIndex}`; 
             args.push(term); 
+            paramIndex++;
         }
 
-        // Fix for More From Seller
         if (supplierId) {
-            sql += ` AND supplier_id = ?`;
-            countSql += ` AND supplier_id = ?`;
+            sql += ` AND supplier_id = $${paramIndex}`;
+            countSql += ` AND supplier_id = $${paramIndex}`;
             args.push(supplierId);
+            paramIndex++;
         }
 
         if (category_id && category_id.trim() !== '') {
             const selectedIds = category_id.split(',').map(id => id.trim()).filter(Boolean);
-            const idsPlaceholder = selectedIds.map(() => '?').join(',');
-            sql += ` AND category_id IN (${idsPlaceholder})`; 
-            countSql += ` AND category_id IN (${idsPlaceholder})`; 
-            args.push(...selectedIds);
+            if (selectedIds.length > 0) {
+                const placeholders = selectedIds.map((_, i) => `$${paramIndex + i}`).join(',');
+                sql += ` AND category_id IN (${placeholders})`; 
+                countSql += ` AND category_id IN (${placeholders})`; 
+                args.push(...selectedIds);
+                paramIndex += selectedIds.length;
+            }
         }
-
-        if (minPrice) { 
-            sql += ` AND (discounted_price >= ? OR price >= ?)`; 
-            countSql += ` AND (discounted_price >= ? OR price >= ?)`; 
-            args.push(minPrice, minPrice); 
-        }
-        if (maxPrice) { 
-            sql += ` AND (discounted_price <= ? OR price <= ?)`; 
-            countSql += ` AND (discounted_price <= ? OR price <= ?)`; 
-            args.push(maxPrice, maxPrice); 
-        }
-
-        // --- EXECUTION ---
-        const shouldCount = page === 1;
-        const clientValues = Object.values(clients).filter(Boolean);
-        
-     const promises = clientValues.map(async (client) => {
-            try {
-                // ✅ CPU OPTIMIZATION: Reduced from 150 to 35.
-                // 35 * 12 shards = 420 items in memory (which is enough to filter and slice 40 for the frontend)
-                // This reduces Vercel CPU load by 75%!
-                const pRes = await client.execute({ sql: sql + ` LIMIT 35`, args });
-                let count = 0;
-                if (shouldCount) {
-                    const cRes = await client.execute({ sql: countSql, args });
-                    count = cRes.rows[0]?.total || 0;
-                }
-                return { products: pRes.rows || [], count };
-            } catch (e) { return { products: [], count: 0 }; }
-        });
-
-        const results = await Promise.all(promises);
-        let allProducts = [];
-        let realTotalCount = 0;
-        results.forEach(r => { allProducts.push(...r.products); realTotalCount += r.count; });
-
-        // 🔥 Construct Cards (Adds Badges, Ratings, etc) 🔥
-        let finalProducts = await constructProductCards(allProducts);
-
-        // --- IN-MEMORY FILTERING ---
-        if (hasVideo === 'true') finalProducts = finalProducts.filter(p => p.has_video);
-        if (showVerified === 'true') finalProducts = finalProducts.filter(p => p.supplier_verified);
-        if (rating) finalProducts = finalProducts.filter(p => Math.round(p.avg_rating) >= parseInt(rating));
-        if (city && city !== 'All') finalProducts = finalProducts.filter(p => p.supplier_city?.toLowerCase() === city.toLowerCase());
 
         // --- SORTING ---
-        if (sort === 'newest') finalProducts.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-        else if (sort === 'price_low_high') finalProducts.sort((a, b) => (a.discounted_price || a.price) - (b.discounted_price || b.price));
-        else if (sort === 'price_high_low') finalProducts.sort((a, b) => (b.discounted_price || b.price) - (a.discounted_price || a.price));
-        else { 
-            // Default: Most reviewed, then most viewed
-            finalProducts.sort((a, b) => {
-                if (b.review_count !== a.review_count) return b.review_count - a.review_count;
-                return b.views - a.views;
-            });
-        }
+        if (sort === 'newest') sql += ` ORDER BY created_at DESC`;
+        else if (sort === 'price_low_high') sql += ` ORDER BY price ASC`;
+        else if (sort === 'price_high_low') sql += ` ORDER BY price DESC`;
+        else sql += ` ORDER BY created_at DESC`;
 
-        const paginatedProducts = finalProducts.slice(offset, offset + limit);
+        sql += ` LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+        const queryArgs = [...args, limit, offset];
 
-      // ✅ FIX: Set header FIRST
-        res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=2592000, stale-while-revalidate=86400');
+        // --- ORACLE EXECUTION ---
+        const [pRes, cRes] = await Promise.all([
+            db.oracle.query(sql, queryArgs),
+            page === 1 ? db.oracle.query(countSql, args) : Promise.resolve({rows: [{total: 0}]})
+        ]);
 
-        // ✅ THEN send the JSON
+        let finalProducts = await constructProductCards(pRes.rows);
+
+        res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=2592000');
+
         return res.status(200).json({
-            products: paginatedProducts,
-            totalCount: shouldCount ? realTotalCount : undefined
+            products: finalProducts,
+            totalCount: page === 1 ? parseInt(cRes.rows[0].total) : undefined
         });
+
     } catch (e) {
-        console.error("Explore Error:", e);
+        console.error("🔴 Oracle Explore Error:", e.message);
         res.status(200).json({ products: [], totalCount: 0 });
     }
 };
 
-
 exports.getProductStats = async (req, res) => {
     try {
         const { id } = req.params;
+        if (!id) return res.json({ views: 0, favorites: 0 });
 
-        // 1. Get Views from Turso
-        let views = 0;
-        try {
-            const vRes = await viewsClient.execute({ 
-                sql: "SELECT views FROM product_views WHERE product_id = ?", 
-                args: [id] 
-            });
-            if (vRes.rows.length > 0) views = vRes.rows[0].views;
-        } catch (e) { console.error("Turso View Error", e); }
+        // Oracle DB views + Redis Buffer
+        const vRes = await db.oracle.query("SELECT views FROM products WHERE id = $1", [id]);
+        const dbViews = vRes.rows.length > 0 ? parseInt(vRes.rows[0].views || 0) : 0;
+        const bufferViews = parseInt(await redis.hGet('product_views_buffer', String(id)) || 0);
 
-        // 2. Get Favorites Count from MySQL
         let favorites = 0;
         if (db.db_social) {
-            const [rows] = await db.db_social.query(
-                "SELECT COUNT(*) as total FROM product_favorites WHERE product_id = ?", 
-                [id]
-            );
+            const [rows] = await db.db_social.query("SELECT COUNT(*) as total FROM product_favorites WHERE product_id = ?", [id]);
             favorites = rows[0].total;
         }
 
-        res.json({ views, favorites });
+        res.json({ 
+            views: dbViews + bufferViews, 
+            favorites: favorites 
+        });
     } catch (error) {
-        console.error("Stats Error:", error);
         res.status(500).json({ views: 0, favorites: 0 });
     }
 };
 
 /* ======================================================
-   2. HOMEPAGE DATA (Controller Update)
+   📦 HOMEPAGE MASTER BUNDLE (ORACLE + TiDB)
+   Used by: getStaticHomeData() in frontend
    ====================================================== */
 exports.getHomepageData = async (req, res) => {
+    // 🔥 YEH LOG SAB SE OOPAR HAI
+    console.log("📡 [REQUEST] Frontend calling: getHomepageData (Homepage Bundle)");
+    
+    const cacheKey = "homepage_master_cache_v5";
     try {
-        const[bannersRes, catsRes] = await Promise.all([
-            db.inventory.query("SELECT id, image_url, link_url FROM banners WHERE is_active = 1").catch(() => [[]]),
-            db.inventory.query("SELECT id, name, image_url, slug, parent_id FROM categories ORDER BY name ASC").catch(() => [[]])
+        const cached = await redis.get(cacheKey);
+        if (cached) {
+            console.log("⚡ [REDIS] Homepage data served from Cache (No DB hit)");
+            return res.json(JSON.parse(cached));
+        }
+
+        console.log("🟢 [ORACLE DB] Cache Miss! Fetching Promoted, Popular & Latest from Oracle...");
+
+        // 2. Fetch IDs from TiDB MySQL (Phase 1)
+        const [bannersRes, catsRes, promotedRows, topReviewedRows, topFavoritedRows] = await Promise.all([
+            db.inventory.query("SELECT id, image_url, link_url FROM banners WHERE is_active = 1"),
+            db.inventory.query("SELECT id, name, image_url, slug, parent_id FROM categories ORDER BY name ASC"),
+            db.inventory.query("SELECT product_id FROM promoted_products WHERE payment_status = 'paid' AND start_date <= NOW() AND end_date >= NOW() ORDER BY start_date DESC LIMIT 50"),
+            db.reviews.query("SELECT product_id FROM product_ratings ORDER BY review_count DESC LIMIT 50"),
+            db.db_social ? db.db_social.query("SELECT product_id, COUNT(*) as f_count FROM product_favorites GROUP BY product_id ORDER BY f_count DESC LIMIT 50").catch(()=>[[]]) : [[ ]]
         ]);
 
-        const[promotedRows, topReviewedRows, topViewedRes] = await Promise.all([
-            db.inventory.query("SELECT product_id FROM promoted_products WHERE payment_status = 'paid' AND start_date <= NOW() AND end_date >= NOW() ORDER BY start_date DESC").catch(() => [[]]),
-            db.reviews.query("SELECT product_id FROM product_ratings ORDER BY review_count DESC, avg_rating DESC LIMIT 50").catch(() =>[[]]),
-            viewsClient ? viewsClient.execute("SELECT product_id FROM product_views ORDER BY views DESC LIMIT 50").catch(() => ({rows:[]})) : Promise.resolve({rows:[]})
+        // 3. Fetch Most Viewed IDs from Oracle Postgres (Phase 2)
+        const topViewedRes = await db.oracle.query("SELECT id FROM products WHERE status = 'in_stock' ORDER BY views DESC LIMIT 50");
+
+        // --- 🎯 SMART ID MERGING (Ensuring 50 products) ---
+        const promotedIds = [...new Set((promotedRows[0] || []).map(r => String(r.product_id)))];
+        
+        // Combine Reviewed, Favorited, and Most Viewed
+        const viralIdsPool = [
+            ...(topReviewedRows[0] || []).map(r => String(r.product_id)),
+            ...(topFavoritedRows[0] || []).map(r => String(r.product_id)),
+            ...(topViewedRes.rows || []).map(r => String(r.id))
+        ];
+
+        // Unique IDs nikal kar top 60 pakrain taake fetch ke baad 50 perfect milen
+        const finalViralIds = [...new Set(viralIdsPool)].slice(0, 60);
+
+        // 4. 🚨 FETCH DATA FROM ORACLE
+        const [promotedRaw, viralRaw, latestRaw] = await Promise.all([
+            getProductsFromOracleByIds(promotedIds),
+            getProductsFromOracleByIds(finalViralIds),
+            db.oracle.query("SELECT * FROM products WHERE status = 'in_stock' ORDER BY created_at DESC LIMIT 50")
         ]);
 
-        const promotedIds =[...new Set(promotedRows[0].map(r => String(r.product_id)))].slice(0, 50);
-        const popularIds = [...new Set([
-            ...topReviewedRows[0].map(r => String(r.product_id)),
-            ...topViewedRes.rows.map(r => String(r.product_id))
-        ])].slice(0, 100);
-
-        const[promotedProductsRaw, popularProductsRaw, ...shardLatestResults] = await Promise.all([
-            getProductsFromTursoByIds(promotedIds),
-            getProductsFromTursoByIds(popularIds),
-            ...Object.values(clients).map(c => c.execute("SELECT * FROM products WHERE status = 'in_stock' ORDER BY created_at DESC LIMIT 20").catch(() => ({ rows: [] })))
+        // 5. Enrich all products
+        const [promotedTop50, viralEnriched, latestProducts] = await Promise.all([
+            constructProductCards(promotedRaw),
+            constructProductCards(viralRaw),
+            constructProductCards(latestRaw.rows)
         ]);
 
-     const rawLatest = shardLatestResults.map(res => res.rows).flat();
-        
-        // ✅ CPU OPTIMIZATION: Sort and slice BEFORE sending to the heavy constructor!
-        const slicedLatestProducts = rawLatest
-            .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
-            .slice(0, 50);
-        
-        const[promotedTop50, popularMixedRaw, latestProducts] = await Promise.all([
-            constructProductCards(promotedProductsRaw),
-            constructProductCards(popularProductsRaw),
-            constructProductCards(slicedLatestProducts) // ✅ FAST: Only processing exactly 50 items
-        ]);
-        
-        // =================================================================
-        //  DEBUG LOG 3: CHECK THE DATA JUST BEFORE SORTING
-        // =================================================================
-        console.log('[DEBUG] Data for Popular sorting:', JSON.stringify(popularMixedRaw.slice(0, 5), null, 2));
+        // --- 🔥 VIRAL SORTING ALGORITHM (Reviews > Favorites > Views) ---
+        const popularProducts = viralEnriched.sort((a, b) => {
+            if (b.review_count !== a.review_count) return b.review_count - a.review_count; // P1: Reviews
+            // Favorites logic inside cards (default to views if equal)
+            return b.views - a.views; 
+        }).slice(0, 50); // Exact 50 products for Popular Section
 
-        const popularMixed = popularMixedRaw.sort((a, b) => {
-            const reviewsA = a.review_count || 0;
-            const reviewsB = b.review_count || 0;
-            if (reviewsB !== reviewsA) return reviewsB - reviewsA;
-            
-            const viewsA = a.views || 0;
-            const viewsB = b.views || 0;
-            if (viewsB !== viewsA) return viewsB - viewsA;
-            
-            return new Date(b.created_at) - new Date(a.created_at);
-        });
-        
-        // Note: latestProducts is already sorted and sliced now!
+        const subCategoriesAll = (catsRes[0] || []).filter(cat => cat.parent_id);
 
-     
+        const response = {
+            banners: bannersRes[0] || [],
+            subCatRow1: subCategoriesAll,
+            promotedTop50: promotedTop50,
+            popularProducts: popularProducts, 
+            latestProducts: latestProducts 
+        };
 
-        const subCategoriesAll = catsRes[0].filter(cat => cat.parent_id);
-        const subCatRow1 = subCategoriesAll.slice(0, 16);
-        const subCatRow2 = subCategoriesAll.slice(16, 32);
-        const subCatRow3 = subCategoriesAll.slice(32, 48);
+        // Cache in Redis for 10 mins
+        await redis.setEx(cacheKey, 600, JSON.stringify(response));
+
+        console.log(`✅ [ORACLE DB] Homepage Bundle Ready. Promoted: ${promotedTop50.length}, Popular Viral: ${popularProducts.length}`);
         
-        // Puraana 60 seconds wala hatae aur ye lagayein:
-res.set('Cache-Control', 'public, max-age=3600, s-maxage=2592000, stale-while-revalidate=86400');
-res.json({ 
-    banners: bannersRes[0] || [], 
-    subCatRow1, subCatRow2, subCatRow3, 
-    promotedTop50, popularMixed, latestProducts 
-});
-        
-        res.json({ 
-            banners: bannersRes[0] ||[], 
-            subCatRow1, subCatRow2, subCatRow3, 
-            promotedTop50, popularMixed, latestProducts 
-        });
+        res.json(response);
 
     } catch (error) {
-        console.error("Homepage Error:", error);
-        res.status(500).json({ 
-            banners:[], subCatRow1: [], subCatRow2: [], subCatRow3:[], 
-            promotedTop50: [], popularMixed: [], latestProducts:[] 
-        });
+        console.error("🔴 Oracle Homepage Error:", error);
+        res.status(500).json({ banners: [], promotedTop50: [], popularProducts: [], latestProducts: [] });
     }
 };
 exports.getHomepageCategories = async (req, res) => {
@@ -641,227 +487,140 @@ exports.getCategoriesWithSubcategories = async (req, res) => {
     }
 };
 
-// ... Keep getSearchSuggestions, getProductBySlug, etc. unchanged below ...
+/* ======================================================
+   🔥 SEARCH SUGGESTIONS (ORACLE DB)
+   ====================================================== */
 exports.getSearchSuggestions = async (req, res) => {
     try {
         const { q } = req.query;
         if(!q || q.length < 2) return res.json([]);
-        const sql = `SELECT title FROM products WHERE LOWER(title) LIKE LOWER(?) LIMIT 5`;
-        const args = [`%${q.trim()}%`];
-        const promises = Object.values(clients).map(c => c.execute({ sql, args }).then(r => r.rows).catch(()=>[]));
-        const results = await Promise.all(promises);
-        const suggestions = [...new Set(results.flat().map(p => p.title))].slice(0, 6);
+
+        console.log(`🟢 [ORACLE DB] Fetching Search Suggestions for: ${q}`);
+
+        const searchTerm = `%${q.trim()}%`;
+        
+        // Postgres ILIKE is case-insensitive by default
+        // SELECT DISTINCT ensures we don't show the same title twice
+        const result = await db.oracle.query(
+            "SELECT DISTINCT title FROM products WHERE title ILIKE $1 LIMIT 6",
+            [searchTerm]
+        );
+
+        const suggestions = result.rows.map(p => p.title);
         res.json(suggestions);
-    } catch(e) { res.json([]); }
+
+    } catch(e) {
+        console.error("🔴 Oracle Suggestions Error:", e.message);
+        res.json([]); 
+    }
 };
 
 /* ======================================================
-   🔥 ULTIMATE-PERFORMANCE: GET PRODUCT BY SLUG (MAP DB INTEGRATED) 🔥
+   🔥 SMART GET PRODUCT BY SLUG (ORACLE + REDIS VIEWS)
    ====================================================== */
 exports.getProductBySlug = async (req, res) => {
     try {
-        // 1. Validate Input
-        let rawParam = req.params.slug || req.params.id;
-        if (!rawParam || rawParam === 'undefined') {
-            return res.status(400).json({ message: "Invalid Product Identifier" });
-        }
-
-        // ✅ FIX: Kept the name exactly as decodedParam everywhere
+        const rawParam = req.params.slug || '';
         const decodedParam = decodeURIComponent(rawParam).trim();
-        const shardKeys = Object.keys(clients);
-
-        // --- STEP 2: SMART PEEL STRATEGY & MAP LOOKUP ---
-        const candidates = new Set();
-        candidates.add(decodedParam); 
-
-        // Pattern: ends with "--123" (ID extraction)
-        const idMatch = decodedParam.match(/--(\d+)$/);
-        const extractedId = idMatch ? idMatch[1] : null;
-
-        const parts = decodedParam.split('-');
-        if (parts.length > 1) {
-            candidates.add(parts.slice(0, -1).join('-')); 
-            if (parts.length > 2) candidates.add(parts.slice(0, -2).join('-'));
-        }
-        const potentialSku = parts[parts.length - 1]; 
-
-        let match = null;
-
-        // 🔥 MAP DATABASE LOOKUP: Find the exact shard in 1 fast query 🔥
-        if (typeof mapClient !== 'undefined' && mapClient) {
-            let mapConditions = [];
-            let mapArgs =[];
-
-            if (extractedId) { mapConditions.push("id = ?"); mapArgs.push(extractedId); }
-            candidates.forEach(c => { mapConditions.push("slug = ?"); mapArgs.push(c); });
-            if (potentialSku) { mapConditions.push("sku = ?"); mapArgs.push(potentialSku); }
-
-            if (mapConditions.length > 0) {
-                try {
-                    console.log(`\n[TEST] 1. Searching for slug "${decodedParam}" in Map Database...`);
-                    const mapSql = `SELECT id, slug, sku, shard_name FROM product_map WHERE ${mapConditions.join(' OR ')}`;
-                    const mapRes = await mapClient.execute({ sql: mapSql, args: mapArgs });
-
-                    if (mapRes.rows.length > 0) {
-                        // Priority: ID > Slug > SKU
-                        let bestMapMatch = null;
-                        if (extractedId) bestMapMatch = mapRes.rows.find(r => String(r.id) === String(extractedId));
-                        if (!bestMapMatch) bestMapMatch = mapRes.rows.find(r => candidates.has(r.slug));
-                        if (!bestMapMatch) bestMapMatch = mapRes.rows.find(r => String(r.sku) === String(potentialSku));
-                        if (!bestMapMatch) bestMapMatch = mapRes.rows[0];
-
-                        const targetShard = bestMapMatch.shard_name;
-                        const targetId = bestMapMatch.id;
-
-                        console.log(`[TEST] 2. ✅ Map Found! Shard is: ${targetShard}. Fetching from this shard only.`);
-
-                        // Fetch the full product from the specific shard
-                        if (targetShard && clients[targetShard]) {
-                            const prodRes = await clients[targetShard].execute({ 
-                                sql: "SELECT * FROM products WHERE id = ? LIMIT 1", 
-                                args: [targetId] 
-                            });
-                            if (prodRes.rows.length > 0) {
-                                match = { p: prodRes.rows[0], key: targetShard };
-                            }
-                        }
-                    }
-                } catch (mapErr) {
-                    console.error("Map DB Lookup Failed:", mapErr.message);
-                }
-            }
+        if (!decodedParam || decodedParam === 'undefined') {
+            return res.status(400).json({ message: "Invalid slug" });
         }
 
-        // 🔥 FALLBACK: If Map DB fails (or product isn't synced yet), use Sequential Search
-        if (!match) {
-            for (const key of shardKeys) {
-                const client = clients[key];
-                
-                if (extractedId) {
-                    const idRes = await client.execute({ sql: "SELECT * FROM products WHERE id = ? LIMIT 1", args: [extractedId] }).catch(()=>({rows:[]}));
-                    if (idRes.rows.length > 0) { match = { p: idRes.rows[0], key }; break; }
-                }
-                if (!match) {
-                    for (const slugCandidate of candidates) {
-                        const slugRes = await client.execute({ sql: "SELECT * FROM products WHERE slug = ? LIMIT 1", args: [slugCandidate] }).catch(()=>({rows:[]}));
-                        if (slugRes.rows.length > 0) { match = { p: slugRes.rows[0], key }; break; }
-                    }
-                    if (match) break;
-                }
-                if (!match && potentialSku) {
-                    const skuRes = await client.execute({ sql: "SELECT * FROM products WHERE sku = ? LIMIT 1", args: [potentialSku] }).catch(()=>({rows:[]}));
-                    if (skuRes.rows.length > 0) { match = { p: skuRes.rows[0], key }; break; }
-                }
-            }
+        console.log(`🔍 [ORACLE DB] Main Search: ${decodedParam}`);
+
+        // 1. Fetch Product from Oracle
+        let result = await db.oracle.query(
+            "SELECT * FROM products WHERE id = $1 OR slug = $1 LIMIT 1", 
+            [decodedParam]
+        );
+
+        // Smart SKU Peeling (If not found)
+        if (result.rows.length === 0 && decodedParam.includes('-')) {
+            const parts = decodedParam.split('-');
+            const lastPart = parts[parts.length - 1];
+            const secondLastPart = parts[parts.length - 2];
+            const fullSku = `${secondLastPart}-${lastPart}`;
+            const peeledSlug = parts.slice(0, parts.length - 2).join('-');
+
+            result = await db.oracle.query(
+                "SELECT * FROM products WHERE sku = $1 OR sku = $2 OR slug = $3 OR id = $2 LIMIT 1", 
+                [fullSku, lastPart, peeledSlug]
+            );
         }
 
-        if (!match) {
-            return res.status(404).json({ message: "Product not found" });
-        }
+        if (result.rows.length === 0) return res.status(404).json({ message: "Not found" });
 
-        const product = match.p;
+        const product = result.rows[0];
 
-        // --- STEP 3: PARALLEL DATA FETCHING ---
-        const viewCountPromise = (typeof viewsClient !== 'undefined' && viewsClient) ? viewsClient.execute({
-            sql: "SELECT views FROM product_views WHERE product_id = ?",
-            args: [product.id]
-        }).catch(e => ({ rows:[] })) : Promise.resolve({ rows:[] });
+        // 2. 🚨 REAL-TIME VIEWS (Oracle DB + Redis Buffer)
+        const dbViews = parseInt(product.views || 0);
+        const bufferViews = parseInt(await redis.hGet('product_views_buffer', String(product.id)) || 0);
+        const totalViews = dbViews + bufferViews;
 
-        const favCountPromise = db.db_social ? db.db_social.query(
-            "SELECT COUNT(*) as total FROM product_favorites WHERE product_id = ?",
-            [product.id]
-        ).catch(e => [[{ total: 0 }]]) : Promise.resolve([[{ total: 0 }]]);
-
-        const[
-            [sup],           
-            [rev],           
-            rel,             
-            varRes,          
-            viewRes,         
-            [favRes],        
-            [promotedRes],
-            [catRes]         // ✅ NEW: Fetch Category Hierarchy for UI Breadcrumbs
-        ] = await Promise.all([
-            db.suppliers.query("SELECT id, brand_name as name, profile_pic, average_rating, followers_count, verified_status, total_products, city FROM suppliers WHERE id = ?", [product.supplier_id]),
-            db.reviews.query("SELECT * FROM reviews WHERE product_id = ? ORDER BY created_at DESC LIMIT 5", [product.id]),
-            
-            // ✅ STRICT LIMIT 7 for Related Products 
-            clients[match.key].execute({ sql: "SELECT * FROM products WHERE category_id = ? AND id != ? LIMIT 7", args: [product.category_id, product.id] }),
-            
-            clients[match.key].execute({ sql: "SELECT * FROM variants WHERE product_id = ?", args: [product.id] }),
-            viewCountPromise,
-            favCountPromise,
-            db.inventory.query("SELECT id FROM promoted_products WHERE product_id = ? AND payment_status='paid' AND end_date > NOW()", [product.id]).catch(()=>[[]]),
-            
-            // ✅ Fetch category & parent category names
-            db.inventory.query(`
-                SELECT c1.name as sub_name, c1.slug as sub_slug, c2.name as parent_name, c2.slug as parent_slug 
-                FROM categories c1 
-                LEFT JOIN categories c2 ON c1.parent_id = c2.id 
-                WHERE c1.id = ?
-            `, [product.category_id]).catch(()=>[[{}]])
+        // 3. Parallel Data Fetching
+        const [varRes, supRes, revRes, relRes, catRes, promotedRes, favCountRes] = await Promise.all([
+            db.oracle.query("SELECT * FROM variants WHERE product_id = $1", [product.id]), 
+            db.suppliers.query("SELECT id, brand_name, profile_pic, verified_status, supplier_code, average_rating, followers_count, total_products, city FROM suppliers WHERE id = ?", [product.supplier_id]),
+            db.reviews.query("SELECT * FROM reviews WHERE product_id = ? ORDER BY created_at DESC LIMIT 10", [product.id]),
+            db.oracle.query("SELECT * FROM products WHERE category_id = $1 AND id != $2 AND status='in_stock' LIMIT 8", [product.category_id, product.id]),
+            db.inventory.query("SELECT c1.name as sub_name, c1.slug as sub_slug, c2.name as parent_name, c2.slug as parent_slug FROM categories c1 LEFT JOIN categories c2 ON c1.parent_id = c2.id WHERE c1.id = ?", [product.category_id]),
+            db.inventory.query("SELECT id FROM promoted_products WHERE product_id = ? AND payment_status='paid' AND end_date > NOW()", [product.id]),
+            db.db_social ? db.db_social.query("SELECT COUNT(*) as total FROM product_favorites WHERE product_id = ?", [product.id]) : Promise.resolve([{total: 0}])
         ]);
 
-        // --- STEP 4: DATA PROCESSING ---
-        let image_urls =[];
-        try { image_urls = typeof product.image_urls === 'string' ? JSON.parse(product.image_urls) : product.image_urls; } catch (e) {}
+        const parsed = parseProduct(product);
+        const relatedEnriched = await constructProductCards(relRes.rows);
 
-        const sData = sup[0] || {};
-        const isVerified = ['verified', 'true', '1'].includes(String(sData.verified_status).toLowerCase());
-
-        const realViews = viewRes.rows.length > 0 ? viewRes.rows[0].views : 0;
-        const realFavorites = favRes[0]?.total || 0;
-        
-        let relatedEnriched = rel.rows;
-        if (typeof constructProductCards === 'function') {
-            relatedEnriched = await constructProductCards(rel.rows);
-        }
-
-        const isPromoted = promotedRes.length > 0;
-        const categoryData = catRes[0] || {};
-
-        // --- STEP 5: FINAL RESPONSE ---
-        res.json({ 
-            ...product, 
-            image_urls,
-            price: parseFloat(product.price),
-            discounted_price: parseFloat(product.discounted_price || product.price),
-            supplier_verified: isVerified,
-            supplier: { 
-                ...sData, 
-                verified_status: isVerified ? 'verified' : 'unverified',
-                is_verified: isVerified
-            }, 
-            // ✅ Include category mapping for UI Breadcrumbs
-            category_info: {
-                name: categoryData.sub_name || "Category",
-                slug: categoryData.sub_slug || "all",
-                parent_name: categoryData.parent_name || null,
-                parent_slug: categoryData.parent_slug || null
+        // 4. Final Response Construction
+        const response = {
+            ...parsed,
+            views: totalViews, // <--- Correct Total Views
+            stats: {
+                views: totalViews,
+                favorites: parseInt(favCountRes[0][0]?.total || 0)
             },
-            reviews: rev, 
-            avg_rating: rev.length > 0 ? (rev.reduce((a, b) => a + parseFloat(b.rating), 0) / rev.length) : 0,
+            brand_name: supRes[0][0]?.brand_name || 'SJ10 Official',
+            supplier: supRes[0][0] || null,
+            variants: varRes.rows || [],
+            reviews: revRes[0] || [],
             related_products: relatedEnriched,
-            variants: varRes.rows ||[],
-            views: realViews,          
-            favorites: realFavorites,  
-            is_promoted: isPromoted,   
-            stats: { views: realViews, favorites: realFavorites }
-        });
+            category_info: {
+                name: catRes[0][0]?.sub_name || "Category",
+                slug: catRes[0][0]?.sub_slug || "all",
+                parent_name: catRes[0][0]?.parent_name || null,
+                parent_slug: catRes[0][0]?.parent_slug || null
+            },
+            is_promoted: promotedRes[0]?.length > 0
+        };
 
-    } catch (e) { 
-        console.error("GetProduct Critical Error:", e);
-        res.status(500).json({ message: "Server Error" }); 
+        res.json(response);
+
+        // 5. ⚡ Increment View in Redis (Atomic)
+        // Detail page khulne par foran Redis mein count barhayen
+      
+
+    } catch (e) {
+        console.error("🔴 Detail Error:", e.message);
+        res.status(500).json({ message: "Server Error" });
     }
 };
 /* ======================================================
    3. CATEGORY ROWS (UPDATED: Selecting the SKU column)
    ====================================================== */
+/* ======================================================
+   🔥 CATEGORY ROWS (ORACLE DB)
+   ====================================================== */
+/* ======================================================
+   🔥 CATEGORY ROWS (VIRAL SORTING + ORACLE DB)
+   Priority: Reviews > Favorites > Views
+   ====================================================== */
 exports.getCategoryRows = async (req, res) => {
+    // 🔥 YEH LOG SAB SE OOPAR HAI
+    console.log("📡 [REQUEST] Frontend calling: getCategoryRows");
+
     try {
-        const [allCats] = await db.inventory.query(
-            "SELECT id, name, slug, db_shard, parent_id FROM categories ORDER BY name ASC"
-        );
+        console.log("🟢 [ORACLE DB] Fetching Viral Category Rows from Oracle...");
+        const [allCats] = await db.inventory.query("SELECT id, name, slug, parent_id FROM categories ORDER BY name ASC");
 
         const parents = allCats.filter(c => !c.parent_id);
         const children = allCats.filter(c => c.parent_id); 
@@ -873,45 +632,70 @@ exports.getCategoryRows = async (req, res) => {
         });
 
         const promises = parents.map(async p => {
-            const client = clients[p.db_shard] || clients.shard_general;
             const subIds = childMap.get(p.id) || [];
-            const ids = [p.id, ...subIds].join(',');
+            const ids = [p.id, ...subIds];
+
+            if (ids.length === 0) return null;
 
             try {
-                // ✅ CRITICAL FIX: Added `sku` to the SELECT statement
+                // Postgres placeholders
+                const placeholders = ids.map((_, i) => `$${i + 1}`).join(',');
+                
+                // Fetch 30 products to sort them by "Viral" metrics
                 const sql = `
-                    SELECT id, title, slug, sku, price, discounted_price, 
-                           image_urls, video_url, supplier_id, created_at, 
-                           category_id, views 
-                    FROM products 
-                    WHERE category_id IN (${ids}) 
+                    SELECT * FROM products 
+                    WHERE category_id IN (${placeholders}) 
                     AND status='in_stock' 
-                    ORDER BY created_at DESC 
-                    LIMIT 10
+                    LIMIT 30
                 `;
                 
-                const res = await client.execute(sql);
+                // 🚨 ORACLE SE DATA LAA RAHAY HAIN
+                const res = await db.oracle.query(sql, ids);
                 
                 if(res.rows.length > 0) {
-                    const enriched = await constructProductCards(res.rows);
-                    return { category_id: p.id, category_name: p.name, category_slug: p.slug, products: enriched };
+                    let enriched = await constructProductCards(res.rows);
+                    
+                    // Add Favorites Count for sorting
+                    let favMap = new Map();
+                    if (db.db_social) {
+                        try {
+                            const pIds = enriched.map(ep => String(ep.id));
+                            const [fCounts] = await db.db_social.query("SELECT product_id, COUNT(*) as c FROM product_favorites WHERE product_id IN (?) GROUP BY product_id", [pIds.length ? pIds : ['0']]);
+                            fCounts.forEach(f => favMap.set(String(f.product_id), f.c));
+                        } catch(e) {}
+                    }
+                    
+                    enriched.forEach(ep => ep.favorites = favMap.get(String(ep.id)) || 0);
+
+                    // 🔥 VIRAL SORTING ALGORITHM 🔥
+                    enriched.sort((a, b) => {
+                        if (b.review_count !== a.review_count) return b.review_count - a.review_count; // P1: Reviews
+                        if (b.favorites !== a.favorites) return b.favorites - a.favorites; // P2: Favorites
+                        return b.views - a.views; // P3: Views
+                    });
+
+                    // Top 10 viral products nikal lo
+                    return { category_id: p.id, category_name: p.name, category_slug: p.slug, products: enriched.slice(0, 10) };
                 }
             } catch(e) {
-                console.error(`Error fetching rows for cat ${p.id}`, e.message);
+                console.error(`🔴 Oracle Category Row Error (Cat ID: ${p.id}):`, e.message);
             }
             return null;
         });
 
         const rows = (await Promise.all(promises)).filter(r => r);
 
-       res.setHeader('Cache-Control', 'public, s-maxage=43200, stale-while-revalidate=3600');
+        res.setHeader('Cache-Control', 'public, s-maxage=43200, stale-while-revalidate=3600');
         res.json(rows);
 
     } catch (e) { 
-        console.error("CategoryRows Error:", e);
+        console.error("🔴 CategoryRows Master Error:", e.message);
         res.json([]); 
     }
 };
+/* ======================================================
+   🔥 CATEGORY PRODUCTS FEED (100% ORACLE DB)
+   ====================================================== */
 exports.getProductsByCategorySlug = async (req, res) => {
     try {
         const { slug } = req.params;
@@ -921,85 +705,109 @@ exports.getProductsByCategorySlug = async (req, res) => {
         
         const { sort = 'default', search, maxPrice, hasVideo, showVerified } = req.query;
 
-        // 1. Get Category Info
-        const [catRows] = await db.inventory.query("SELECT id, name, slug, db_shard FROM categories WHERE slug = ?", [slug]);
-        if (catRows.length === 0) return res.status(404).json({ message: "Not found" });
+        console.log(`🟢 [ORACLE DB] Fetching Products for Category: ${slug}`);
+
+        // 1. Get Category Info from TiDB (MySQL)
+        const [catRows] = await db.inventory.query("SELECT id, name, slug FROM categories WHERE slug = ?", [slug]);
+        if (catRows.length === 0) return res.status(404).json({ message: "Category not found" });
         const category = catRows[0];
-        const client = clients[category.db_shard || 'shard_general'] || clients.shard_general;
 
-        // 2. Get Subcategory IDs
+        // 2. Get All Subcategory IDs (taake parent category mein children ka data bhi aaye)
         const [children] = await db.inventory.query("SELECT id FROM categories WHERE parent_id = ?", [category.id]);
-        const ids = [category.id, ...children.map(c => c.id)].join(',');
+        const allCategoryIds = [category.id, ...children.map(c => c.id)];
 
-        // 3. Build SQL for Turso
-        let sql = `SELECT * FROM products WHERE category_id IN (${ids}) AND status = 'in_stock'`;
-        let countSql = `SELECT COUNT(*) as total FROM products WHERE category_id IN (${ids}) AND status = 'in_stock'`;
+        // 3. Build Oracle (Postgres) Query
+        let sql = `SELECT * FROM products WHERE status = 'in_stock'`;
+        let countSql = `SELECT COUNT(*) as total FROM products WHERE status = 'in_stock'`;
         let args = [];
+        let pIndex = 1; // Postgres uses $1, $2...
 
-        // 🔥 SEARCH FILTER
+        // --- A. Category Filter ---
+        const placeholders = allCategoryIds.map((_, i) => `$${pIndex + i}`).join(',');
+        sql += ` AND category_id IN (${placeholders})`;
+        countSql += ` AND category_id IN (${placeholders})`;
+        args.push(...allCategoryIds);
+        pIndex += allCategoryIds.length;
+
+        // --- B. Search Filter (ILIKE for case-insensitive) ---
         if (search) {
-            sql += ` AND LOWER(title) LIKE ?`;
-            countSql += ` AND LOWER(title) LIKE ?`;
-            args.push(`%${search.toLowerCase()}%`);
+            sql += ` AND (title ILIKE $${pIndex} OR description ILIKE $${pIndex})`;
+            countSql += ` AND (title ILIKE $${pIndex} OR description ILIKE $${pIndex})`;
+            args.push(`%${search.trim()}%`);
+            pIndex++;
         }
 
-        // 🔥 PRICE FILTER
+        // --- C. Price Filter ---
         if (maxPrice) {
-            sql += ` AND price <= ?`;
-            countSql += ` AND price <= ?`;
+            sql += ` AND price <= $${pIndex}`;
+            countSql += ` AND price <= $${pIndex}`;
             args.push(parseFloat(maxPrice));
+            pIndex++;
         }
 
-        // 🔥 VIDEO FILTER (The Fix)
+        // --- D. Video Filter ---
         if (hasVideo === 'true') {
             const videoClause = ` AND (video_url IS NOT NULL AND video_url != '' OR image_urls LIKE '%.mp4%')`;
             sql += videoClause;
             countSql += videoClause;
         }
 
-        // 4. SORTING
+        // --- E. Sorting ---
         if (sort === 'price_high') sql += ` ORDER BY price DESC`;
         else if (sort === 'price_low') sql += ` ORDER BY price ASC`;
         else sql += ` ORDER BY created_at DESC`;
 
-        sql += ` LIMIT ? OFFSET ?`;
-        const queryArgs = [...args, limit, offset];
+        // --- F. Pagination ---
+        sql += ` LIMIT $${pIndex} OFFSET $${pIndex + 1}`;
+        const finalArgs = [...args, limit, offset];
 
-        // 5. Execute
+        // 4. Parallel Execution in Oracle
         const [pRes, cRes] = await Promise.all([
-            client.execute({ sql, args: queryArgs }),
-            client.execute({ sql: countSql, args })
+            db.oracle.query(sql, finalArgs),
+            db.oracle.query(countSql, args)
         ]);
 
-        // 6. Enrich with Supplier Data & Badges
+        // 5. Enrich with Supplier Data & Badges
         let enrichedProducts = await constructProductCards(pRes.rows);
         
-        // 🔥 VERIFIED FILTER (In-Memory because it's a cross-DB check)
+        // --- G. Verified Supplier Filter (In-Memory) ---
         if (showVerified === 'true') {
             enrichedProducts = enrichedProducts.filter(p => p.supplier_verified === true);
         }
 
-        res.set('Cache-Control', 'public, s-maxage=86400'); // 1 Day Cache
+        res.set('Cache-Control', 'public, max-age=3600');
         res.json({ 
             category, 
             products: enrichedProducts, 
-            total: cRes.rows[0].total, 
-            totalPages: Math.ceil(cRes.rows[0].total / limit), 
+            total: parseInt(cRes.rows[0].total), 
+            totalPages: Math.ceil(parseInt(cRes.rows[0].total) / limit), 
             currentPage: page 
         });
 
     } catch (e) { 
-        console.error("Category Controller Error:", e);
+        console.error("🔴 Oracle Category Fetch Error:", e.message);
         res.status(500).json({message: "Server Error"}); 
     }
 };
 exports.incrementProductView = async (req, res) => {
     try {
-        const { id } = req.params; 
-        await viewsClient.execute({ sql: `INSERT INTO product_views (product_id, views) VALUES (?, 1) ON CONFLICT(product_id) DO UPDATE SET views = views + 1`, args: [id] });
+        const { id } = req.params;
+        if (!id || id === 'undefined') return res.json({ status: "ignored" });
+
+        // 🔥 Redis Increment
+        const newCount = await redis.hIncrBy('product_views_buffer', String(id), 1);
+        
+        // terminal mein log dikhane ke liye
+        console.log(`📈 [VIEW] Product ID: ${id.substring(0,8)}... | New Buffer Count: ${newCount}`);
+
         res.json({ status: "ok" });
-    } catch(e) { res.json({ status: "error" }); }
+    } catch(e) {
+        console.error("🔴 Redis View Error:", e.message);
+        res.json({ status: "error" });
+    }
 };
+
+
 
 exports.getActivePromotionalTimer = async (req, res) => {
     try {
@@ -1025,30 +833,41 @@ exports.getCategoriesWithSubcategories = async (req, res) => {
     } catch (error) { res.status(500).json({ mainCats: [] }); }
 };
 
+/* ======================================================
+   🔥 GET PRODUCT BY ID (ORACLE DB)
+   ====================================================== */
 exports.getProductById = async (req, res) => {
     try {
         const { id } = req.params;
-        const shardKeys = Object.keys(clients);
-        const searchPromises = shardKeys.map(async (key) => {
-            const client = clients[key];
-            try {
-                const res = await client.execute({ sql: "SELECT * FROM products WHERE id = ? LIMIT 1", args: [id] });
-                return res.rows.length > 0 ? { product: res.rows[0], client: client } : null;
-            } catch (e) { return null; }
-        });
-        const results = await Promise.all(searchPromises);
-        const match = results.find(r => r !== null);
-        if (!match) return res.status(404).json({ message: "Product not found" });
-        const { product, client } = match;
+        console.log(`🟢 [ORACLE DB] Fetching Product by ID: ${id}`);
+
+        // 1. Fetch Product from Oracle
+        const result = await db.oracle.query("SELECT * FROM products WHERE id = $1 LIMIT 1", [id]);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ message: "Product not found in Oracle" });
+        }
+
+        const product = result.rows[0];
+
+        // 2. Fetch Variants from Oracle
         let variants = [];
         try {
-            const variantRes = await client.execute({ sql: "SELECT * FROM variants WHERE product_id = ?", args: [product.id] });
+            const variantRes = await db.oracle.query("SELECT * FROM variants WHERE product_id = $1", [product.id]);
             variants = variantRes.rows;
-        } catch (e) { }
+        } catch (e) {
+            console.error("🔴 Oracle Variants Error:", e.message);
+        }
+
         const finalProduct = parseProduct(product);
         finalProduct.variants = variants; 
+        
         res.json(finalProduct);
-    } catch (error) { res.status(500).json({ message: "Server Error" }); }
+
+    } catch (error) {
+        console.error("🔴 Oracle Get Product By ID Error:", error.message);
+        res.status(500).json({ message: "Server Error" });
+    }
 };
 
 // --- THIS LINE ALSO NEEDS TO BE IN THE FILE to export getExploreFeed correctly if you replaced getAllProducts logic completely
@@ -1056,399 +875,328 @@ exports.getProductById = async (req, res) => {
 
 
 
-
 /* ======================================================
-   🔥 ULTIMATE SITEMAP GENERATOR (Images + Video) 🔥
+   🔥 ULTIMATE SITEMAP GENERATOR (ORACLE + REDIS)
+   Cache Timing: 24 Hours (86400s)
    ====================================================== */
 exports.getSitemapUrls = async (req, res) => {
-  try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 1000;
-    const offset = (page - 1) * limit;
-
-    // 🔥 CHANGED: Added title, description, and video_url
-    // We limit description to 200 chars to keep the sitemap file size small
-    const sql = `
-      SELECT title, slug, sku, created_at as lastmod, image_urls, video_url, LEFT(description, 200) as short_desc
-      FROM products
-    `;
-
-    const clientValues = Object.values(clients).filter(Boolean);
-
-    // 1. Fetch
-    const promises = clientValues.map(client =>
-      client.execute({ sql })
-        .then(r => r.rows || [])
-        .catch(() => [])
-    );
-
-    const results = await Promise.all(promises);
-    const allProducts = results.flat();
-
-    // 2. Sort
-    allProducts.sort((a, b) => {
-        if (a.id && b.id) return a.id - b.id; 
-        return 0; 
-    });
-
-    // 3. Paginate
-    const paginatedProducts = allProducts.slice(offset, offset + limit);
-
-    res.json({
-      products: paginatedProducts,
-      totalCount: allProducts.length
-    });
-
-  } catch (e) {
-    console.error("Sitemap Error:", e);
-    res.status(500).json({ products: [], totalCount: 0 });
-  }
-};
-// Add this new function anywhere in productController.js
-
-/* ======================================================
-   🔥 LIGHTWEIGHT COUNT ENDPOINT 🔥
-   ====================================================== */
-exports.getSitemapCount = async (req, res) => {
     try {
-        const countSql = `SELECT COUNT(id) as total FROM products`;
-        const clientValues = Object.values(clients).filter(Boolean);
-        
-        const promises = clientValues.map(client =>
-            client.execute(countSql).then(r => r.rows[0]?.total || 0).catch(() => 0)
-        );
-        
-        const results = await Promise.all(promises);
-        const totalCount = results.reduce((sum, count) => sum + count, 0);
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 1000;
+        const offset = (page - 1) * limit;
+        const cacheKey = `sitemap_urls_v2_p${page}_l${limit}`;
 
-        // Set a short cache, as this is hit frequently by Google
-        res.set('Cache-Control', 'public, s-maxage=3600'); // Cache for 1 hour
-        res.json({ total: totalCount });
+        // 1. Check Redis Super Cache
+        const cached = await redis.get(cacheKey);
+        if (cached) {
+            console.log(`⚡ [REDIS] Serving Sitemap Page ${page} from Cache`);
+            return res.json(JSON.parse(cached));
+        }
+
+        console.log(`🟢 [ORACLE DB] Cache Miss! Generating Sitemap Page ${page}...`);
+
+        // 2. Fetch from Oracle Postgres (Single Query, No Shards)
+        const sql = `
+            SELECT title, slug, sku, created_at as lastmod, image_urls, video_url, LEFT(description, 200) as short_desc 
+            FROM products 
+            ORDER BY id ASC 
+            LIMIT $1 OFFSET $2
+        `;
+        
+        // Parallel queries: Data + Total Count
+        const [dataRes, countRes] = await Promise.all([
+            db.oracle.query(sql, [limit, offset]),
+            db.oracle.query("SELECT COUNT(*) as total FROM products")
+        ]);
+
+        const response = {
+            products: dataRes.rows,
+            totalCount: parseInt(countRes.rows[0].total)
+        };
+
+        // 3. Save to Redis for 24 Hours
+        await redis.setEx(cacheKey, 86400, JSON.stringify(response));
+
+        res.json(response);
 
     } catch (e) {
-        console.error("Sitemap Count Error:", e);
-        res.status(500).json({ total: 0 });
+        console.error("🔴 Oracle Sitemap Error:", e.message);
+        res.status(500).json({ products: [], totalCount: 0 });
     }
 };
 
 /* ======================================================
-   🔥 ENTERPRISE GOOGLE SHOPPING FEED (Images + Variants) 🔥
+   🔥 LIGHTWEIGHT COUNT ENDPOINT (ORACLE + REDIS)
    ====================================================== */
+exports.getSitemapCount = async (req, res) => {
+    const cacheKey = "sitemap_total_count_v2";
+    try {
+        // 1. Check Redis
+        const cachedCount = await redis.get(cacheKey);
+        if (cachedCount) {
+            console.log("⚡ [REDIS] Serving Sitemap Count from Cache");
+            return res.json({ total: parseInt(cachedCount) });
+        }
+
+        console.log("🟢 [ORACLE DB] Cache Miss! Fetching Total Product Count...");
+
+        // 2. Query Oracle (Direct Count)
+        const result = await db.oracle.query("SELECT COUNT(id) as total FROM products");
+        const totalCount = parseInt(result.rows[0].total || 0);
+
+        // 3. Save to Redis for 24 Hours
+        await redis.setEx(cacheKey, 86400, String(totalCount));
+
+        // Browser Cache Header (1 Hour)
+        res.set('Cache-Control', 'public, s-maxage=3600'); 
+        res.json({ total: totalCount });
+
+    } catch (e) {
+        console.error("🔴 Sitemap Count Oracle Error:", e.message);
+        res.status(500).json({ total: 0 });
+    }
+};
 exports.getGoogleShoppingProducts = async (req, res) => {
     try {
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 1000;
         const offset = (page - 1) * limit;
+        const cacheKey = `google_json_feed_pg_${page}`;
 
-        // 1. Fetch products + variants
-        const sql = `
-            SELECT p.id, p.title, p.slug, p.sku, p.description, p.price, 
-                   p.discounted_price, p.image_urls, p.image_url as thumbnail, p.brand
-            FROM products p
-            WHERE p.status = 'in_stock'
-        `;
+        // 1. Check Redis Super Cache
+        const cachedData = await redis.get(cacheKey);
+        if (cachedData) {
+            console.log(`⚡ [REDIS] Serving Google JSON Feed Page ${page} from Cache`);
+            return res.json(JSON.parse(cachedData));
+        }
 
-        const clientValues = Object.values(clients).filter(Boolean);
-        const promises = clientValues.map(client => 
-            client.execute({ sql }).then(r => r.rows || []).catch(() => [])
-        );
-        const results = await Promise.all(promises);
-        let allProducts = results.flat();
-        
-        // Paginate after flat
-        const paginatedProducts = allProducts.slice(offset, offset + limit);
+        console.log(`🟢 [ORACLE DB] Cache Miss! Generating Google JSON Feed Page ${page}...`);
 
-        // 2. Fetch variants for these specific products to map them
-        const pIds = paginatedProducts.map(p => p.id);
-        const variantPromises = clientValues.map(client => 
-            client.execute({ sql: `SELECT * FROM variants WHERE product_id IN (${pIds.map(()=>'?').join(',')})`, args: pIds })
-            .then(r => r.rows || [])
-            .catch(() => [])
-        );
-        const varResults = await Promise.all(variantPromises);
-        const allVariants = varResults.flat();
+        // 2. Fetch from Oracle
+        const sql = `SELECT id, title, slug, sku, description, price, discounted_price, image_urls, image_url as thumbnail, brand
+                     FROM products WHERE status = 'in_stock' ORDER BY id ASC LIMIT $1 OFFSET $2`;
+        const pRes = await db.oracle.query(sql, [limit, offset]);
+        const products = pRes.rows;
 
-        // 3. Construct Data
-        const finalProducts = paginatedProducts.map(p => {
-            // A. Handle Images (Multiple)
+        if (products.length === 0) return res.json({ products: [], totalCount: 0 });
+
+        const pIds = products.map(p => p.id);
+        const vRes = await db.oracle.query(`SELECT * FROM variants WHERE product_id IN (${pIds.map((_, i) => `$${i + 1}`).join(',')})`, pIds);
+        const allVariants = vRes.rows;
+
+        const finalProducts = products.map(p => {
             let imageList = [];
             try {
                 const parsed = typeof p.image_urls === 'string' ? JSON.parse(p.image_urls) : p.image_urls;
-                imageList = Array.isArray(parsed) ? parsed : [p.thumbnail].filter(Boolean);
-            } catch(e) { imageList = [p.thumbnail].filter(Boolean); }
-
-            // B. Handle Variants
-            const productVariants = allVariants.filter(v => v.product_id === p.id);
+                imageList = Array.isArray(parsed) ? parsed : [p.thumbnail || p.image_url].filter(Boolean);
+            } catch(e) { imageList = [p.thumbnail || p.image_url].filter(Boolean); }
 
             return {
                 id: p.sku || `SJ10-${p.id}`,
                 title: p.title,
                 description: p.description,
-                link: p.slug,
-                // Google takes up to 10 images. We provide the array.
+                link: `https://www.sj10.pk/products/${p.slug}${p.sku ? '-' + p.sku : ''}`,
                 image_links: imageList, 
-                price: parseFloat(p.price),
-                sale_price: parseFloat(p.discounted_price || p.price),
-                // 🔥 BRAND FIX: Use product brand if exists, else "SJ10"
+                price: parseFloat(p.price || 0),
+                sale_price: parseFloat(p.discounted_price || p.price || 0),
                 brand: (p.brand && p.brand.trim() !== "") ? p.brand : "SJ10",
-                variants: productVariants
+                variants: allVariants.filter(v => v.product_id === p.id)
             };
         });
 
-        res.json({ products: finalProducts, totalCount: allProducts.length });
+        const countRes = await db.oracle.query("SELECT COUNT(*) FROM products WHERE status = 'in_stock'");
+        const response = { products: finalProducts, totalCount: parseInt(countRes.rows[0].count) };
+
+        // 3. Save to Redis for 2 Hours
+        await redis.setEx(cacheKey, 7200, JSON.stringify(response));
+
+        res.json(response);
     } catch (e) {
+        console.error("🔴 JSON Feed Error:", e.message);
         res.status(500).json({ products: [] });
     }
 };
-/* ======================================================
-   🔥 GOOGLE SHOPPING MASTER FEED (1 LINK FOR EVERYTHING) 🔥
-   ====================================================== */
 exports.getGoogleShoppingMasterFeed = async (req, res) => {
+  const cacheKey = "google_shopping_xml_master";
   try {
+    // 1. Check Redis First
+    const cachedXml = await redis.get(cacheKey);
+    if (cachedXml) {
+        console.log("⚡ [REDIS] Serving Master XML Feed from Super Cache");
+        res.set('Content-Type', 'application/xml');
+        return res.send(cachedXml);
+    }
+
+    console.log("🟢 [ORACLE DB] Cache Miss! Generating Massive Master XML Feed...");
+
     const BASE_URL = "https://www.sj10.pk";
-    
-    // Fetch ALL in-stock products
-    const sql = `
-      SELECT id, title, slug, sku, description, price, discounted_price, image_urls 
-      FROM products 
-      WHERE status = 'in_stock'
-    `;
+    const result = await db.oracle.query("SELECT id, title, slug, sku, description, price, discounted_price, image_urls, image_url FROM products WHERE status = 'in_stock'");
+    const allProducts = result.rows;
 
-    const clientValues = Object.values(clients).filter(Boolean);
-    const promises = clientValues.map(client => client.execute({ sql }).then(r => r.rows ||[]).catch(() =>[]));
-    const results = await Promise.all(promises);
-    const allProducts = results.flat();
+    const escapeXml = (str) => String(str || "").replace(/[<>&'"]/g, (c) => ({'<':'&lt;','>':'&gt;','&':'&amp;','\'':'&apos;','"':'&quot;'}[c] || c));
 
-    // Helper to clean XML characters
-    const escapeXml = (str) => {
-        if (!str) return "";
-        return String(str).replace(/[<>&'"]/g, (c) => {
-            switch (c) {
-                case '<': return '&lt;'; case '>': return '&gt;';
-                case '&': return '&amp;'; case '\'': return '&apos;';
-                case '"': return '&quot;'; default: return c;
-            }
-        });
-    };
+    let xml = `<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">\n<channel>\n<title>SJ10.pk Master Product Feed</title>\n<link>${BASE_URL}</link>\n<description>Best Online Shopping in Pakistan</description>`;
 
-    // Build the XML Header
-    let xml = `<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">
-<channel>
-<title>SJ10.pk Master Product Feed</title>
-<link>${BASE_URL}</link>
-<description>Best Online Shopping in Pakistan</description>`;
-
-    // Loop through ALL products
     allProducts.forEach(p => {
-        const slug = p.sku ? `${p.slug}-${p.sku}` : p.slug;
-        const fullLink = `${BASE_URL}/products/${encodeURIComponent(slug)}`;
-
-        // Extract Image
-        let imageUrl = "";
+        const fullLink = `${BASE_URL}/products/${p.slug}${p.sku ? '-' + p.sku : ''}`;
+        let imageUrl = p.image_url || "";
         try {
             if (p.image_urls) {
-                if (typeof p.image_urls === 'string') {
-                    imageUrl = p.image_urls.startsWith('[') ? JSON.parse(p.image_urls)[0] : p.image_urls;
-                } else if (Array.isArray(p.image_urls)) {
-                    imageUrl = p.image_urls[0];
-                }
+                const arr = typeof p.image_urls === 'string' ? JSON.parse(p.image_urls) : p.image_urls;
+                if(Array.isArray(arr) && arr.length > 0) imageUrl = arr[0];
             }
         } catch(e) {}
 
-        const price = parseFloat(p.price);
-        const salePrice = parseFloat(p.discounted_price || p.price);
-
-        xml += `
-<item>
-  <g:id>${escapeXml(p.sku || p.id)}</g:id>
-  <g:title>${escapeXml(p.title)}</g:title>
-  <g:description>${escapeXml(p.description ? p.description.substring(0, 2000) : p.title)}</g:description>
-  <g:link>${fullLink}</g:link>
-  <g:image_link>${escapeXml(imageUrl)}</g:image_link>
-  <g:condition>new</g:condition>
-  <g:availability>in stock</g:availability>
-  <g:price>${price} PKR</g:price>
-  ${salePrice < price ? `<g:sale_price>${salePrice} PKR</g:sale_price>` : ''}
-  <g:brand>SJ10</g:brand>
-  <g:identifier_exists>no</g:identifier_exists>
-</item>`;
+        xml += `\n<item>\n  <g:id>${escapeXml(p.sku || p.id)}</g:id>\n  <g:title>${escapeXml(p.title)}</g:title>\n  <g:description>${escapeXml(p.description ? p.description.substring(0, 2000) : p.title)}</g:description>\n  <g:link>${escapeXml(fullLink)}</g:link>\n  <g:image_link>${escapeXml(imageUrl)}</g:image_link>\n  <g:availability>in stock</g:availability>\n  <g:price>${parseFloat(p.price)} PKR</g:price>\n  ${parseFloat(p.discounted_price) < parseFloat(p.price) ? `<g:sale_price>${parseFloat(p.discounted_price)} PKR</g:sale_price>` : ''}\n  <g:brand>SJ10</g:brand>\n</item>`;
     });
 
-    xml += `
-</channel>
-</rss>`;
+    xml += `\n</channel>\n</rss>`;
 
-    // Send as an XML File
+    // 2. Save entire XML string to Redis for 4 Hours
+    await redis.setEx(cacheKey, 14400, xml);
+
     res.set('Content-Type', 'application/xml');
-    // Cache for 2 hours to prevent database overload
-    res.set('Cache-Control', 'public, s-maxage=7200, stale-while-revalidate=3600');
     res.send(xml);
-
   } catch (e) {
-    console.error("Master Feed Error:", e);
+    console.error("🔴 XML Feed Error:", e.message);
     res.status(500).send("Error generating feed");
   }
 };
-
 /* ======================================================
    🚀 REAL-TIME LATEST PRODUCTS (NO-CACHE)
    Fetches the 40 most recent entries across all shards
    ====================================================== */
+/* ======================================================
+   🚀 REAL-TIME LATEST PRODUCTS (ORACLE DB)
+   ====================================================== */
 exports.getLatestProductsRealTime = async (req, res) => {
     try {
-        const clientValues = Object.values(clients).filter(Boolean);
+        // 🔥 YEH LOG TERMINAL MEIN AAYEGA TOU MATLAB ORACLE CHAL RAHA HAI
+        console.log("🟢 [ORACLE DB] Fetching Latest Real-Time Products...");
 
-        // 1. Query all shards in parallel for the 40 newest items each
-        const promises = clientValues.map(async (client) => {
-            try {
-                const sql = `
-                    SELECT id, title, slug, sku, price, discounted_price, 
-                           image_urls, video_url, supplier_id, created_at 
-                    FROM products 
-                    WHERE status = 'in_stock'
-                    ORDER BY created_at DESC 
-                    LIMIT 40
-                `;
-                const result = await client.execute(sql);
-                return result.rows || [];
-            } catch (e) {
-                console.error("Shard Fetch Error (Latest):", e.message);
-                return [];
-            }
-        });
-
-        const allShardResults = await Promise.all(promises);
+        // Seedha Oracle se 40 latest products uthao (No Turso Shards!)
+        const sql = `
+            SELECT id, title, slug, sku, price, discounted_price, 
+                   image_urls, video_url, supplier_id, created_at 
+            FROM products 
+            WHERE status = 'in_stock'
+            ORDER BY created_at DESC 
+            LIMIT 40
+        `;
         
-        // 2. Flatten and Sort the combined results by date
-        const combinedProducts = allShardResults
-            .flat()
-            .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
-            .slice(0, 40); // Keep exactly 40
+        const result = await db.oracle.query(sql);
 
-        // 3. Enrich with Supplier Badges and Ratings
-        // (Using your existing constructProductCards helper)
-        const finalProducts = await constructProductCards(combinedProducts);
+        // Enrich with Supplier Badges and Ratings
+        const finalProducts = await constructProductCards(result.rows || []);
 
-        // 4. CRUCIAL: Set Headers to bypass all caching
-        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-        res.setHeader('Pragma', 'no-cache');
-        res.setHeader('Expires', '0');
-        res.setHeader('Surrogate-Control', 'no-store');
-
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
         res.status(200).json(finalProducts);
 
     } catch (error) {
-        console.error("Latest Products Real-Time Error:", error);
-        res.status(500).json({ message: "Failed to fetch fresh products" });
+        console.error("🔴 Latest Products Oracle Error:", error.message);
+        res.status(500).json({ message: "Failed to fetch fresh products from Oracle" });
     }
 };
 
 
 /**
- * 🔥 LIGHTWEIGHT PRODUCT CARDS API
- * Optimized for: Low Quota Usage, High Speed, and CDN Caching
+ * 🔥 LIGHTWEIGHT PRODUCT CARDS API (100% ORACLE DB)
+ * Optimized for: Extreme speed, Low Bandwidth, and Oracle Postgres
  */
 exports.getProductCards = async (req, res) => {
     try {
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 40; 
         const offset = (page - 1) * limit;
-        
-        const shardKey = req.query.shard || 'shard_general';
-        const client = clients[shardKey] || clients.shard_general;
 
-        // Fetching image_urls and video_url to detect videos correctly
+        console.log(`🟢 [ORACLE DB] Fetching Lite Product Cards -> Page: ${page}`);
+
+        // 1. Fetch from Oracle (No Shards needed!)
         const sql = `
-            SELECT id, title, slug, sku, price, discounted_price, image_url, image_urls, video_url, supplier_id 
+            SELECT id, title, slug, sku, price, discounted_price, 
+                   image_url, image_urls, video_url, supplier_id 
             FROM products 
             WHERE status = 'in_stock'
             ORDER BY created_at DESC 
-            LIMIT ? OFFSET ?
+            LIMIT $1 OFFSET $2
         `;
         const args = [limit, offset];
 
-        const result = await client.execute({ sql, args });
+        const result = await db.oracle.query(sql, args);
         const rawProducts = result.rows;
 
         if (rawProducts.length === 0) {
             return res.json({ products: [], hasMore: false });
         }
 
+        // 2. Prepare for Cross-DB Enrichment (TiDB MySQL)
         const productIds = rawProducts.map(p => p.id);
         const supplierIds = [...new Set(rawProducts.map(p => p.supplier_id).filter(Boolean))];
         
         let supplierMap = new Map();
         let ratingsMap = new Map();
 
-        // 1. Get Verification Status
+        // 3. Parallel Enrichment from TiDB
+        const enrichmentPromises = [];
+
         if (supplierIds.length > 0) {
-            const [suppliers] = await db.suppliers.query(
-                "SELECT id, verified_status, brand_name FROM suppliers WHERE id IN (?)",
-                [supplierIds]
+            enrichmentPromises.push(
+                db.suppliers.query("SELECT id, verified_status, brand_name FROM suppliers WHERE id IN (?)", [supplierIds])
+                .then(([rows]) => rows.forEach(s => {
+                    supplierMap.set(String(s.id), {
+                        isVerified: String(s.verified_status).toLowerCase() === 'verified',
+                        brand: s.brand_name
+                    });
+                }))
             );
-            suppliers.forEach(s => {
-                supplierMap.set(String(s.id), {
-                    isVerified: String(s.verified_status).toLowerCase() === 'verified',
-                    brand: s.brand_name
-                });
-            });
         }
 
-        // 2. Get Organic Reviews
-        if (productIds.length > 0 && db.reviews) {
-            try {
-                const [ratings] = await db.reviews.query(
-                    "SELECT product_id, avg_rating, review_count FROM product_ratings WHERE product_id IN (?)",
-                    [productIds]
-                );
-                ratings.forEach(r => {
+        if (productIds.length > 0) {
+            enrichmentPromises.push(
+                db.reviews.query("SELECT product_id, avg_rating, review_count FROM product_ratings WHERE product_id IN (?)", [productIds])
+                .then(([rows]) => rows.forEach(r => {
                     ratingsMap.set(String(r.product_id), {
                         rating: parseFloat(r.avg_rating),
                         count: parseInt(r.review_count)
                     });
-                });
-            } catch (e) { console.error(e); }
+                }))
+            );
         }
 
-        // 3. Format to Lite Object
+        await Promise.all(enrichmentPromises).catch(e => console.error("Enrichment Error:", e.message));
+
+        // 4. Format to Ultra-Lite Shorthand Object
         const optimizedProducts = rawProducts.map(p => {
-            const sInfo = supplierMap.get(String(p.supplier_id)) || { isVerified: false, brand: 'Unknown' };
+            const sInfo = supplierMap.get(String(p.supplier_id)) || { isVerified: false, brand: 'SJ10 Official' };
             const rInfo = ratingsMap.get(String(p.id)) || { rating: 0, count: 0 };
 
-            // Determine correct image and video status
+            // Image and Video logic
             let finalImg = p.image_url;
-            let hasVideo = false;
-
             try {
                 const parsedImgs = typeof p.image_urls === 'string' ? JSON.parse(p.image_urls) : p.image_urls;
-                if (Array.isArray(parsedImgs) && parsedImgs.length > 0) {
-                    finalImg = parsedImgs[0];
-                }
+                if (Array.isArray(parsedImgs) && parsedImgs.length > 0) finalImg = parsedImgs[0];
             } catch(e) {}
 
-            if ((p.video_url && p.video_url.length > 5) || (typeof p.image_urls === 'string' && p.image_urls.includes('.mp4'))) {
-                hasVideo = true;
-            }
+            const hasVideo = (p.video_url && p.video_url.length > 5) || (typeof p.image_urls === 'string' && p.image_urls.includes('.mp4'));
 
             return {
                 id: p.id,
-                t: p.title,               
-                s: p.slug,
-                sku: p.sku,
-                p: parseFloat(p.price),
-                dp: parseFloat(p.discounted_price || p.price),
-                img: finalImg,         
-                v: sInfo.isVerified,      
-                b: sInfo.brand,
-                r: rInfo.rating,     
-                rc: rInfo.count,
-                hv: hasVideo // ✅ Passes video status directly from backend!
+                t: p.title,               // title
+                s: p.slug,                // slug
+                sku: p.sku || 'N/A',      // sku
+                p: parseFloat(p.price),   // price
+                dp: parseFloat(p.discounted_price || p.price), // discounted price
+                img: finalImg,            // image
+                v: sInfo.isVerified,      // verified
+                b: sInfo.brand,           // brand
+                r: rInfo.rating,          // rating
+                rc: rInfo.count,          // review count
+                hv: hasVideo              // has video
             };
         });
 
-        // 🔥 THE ULTIMATE 1-MONTH CACHE HEADER 🔥
-        res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=2592000, stale-while-revalidate=86400');
+        // 🔥 Edge Caching Headers
+        res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=2592000');
 
         res.json({
             products: optimizedProducts,
@@ -1457,11 +1205,10 @@ exports.getProductCards = async (req, res) => {
         });
 
     } catch (error) {
-        console.error("Feed Cards Error:", error);
+        console.error("🔴 Oracle Lite Cards Error:", error.message);
         res.status(500).json({ message: "Error fetching cards" });
     }
 };
-
 
 // 1. Dedicated Banners API (12 Hours)
 exports.getBanners = async (req, res) => {
@@ -1473,45 +1220,83 @@ exports.getBanners = async (req, res) => {
     } catch (e) { res.json([]); }
 };
 
-// 🔥 SMART POPULAR PRODUCTS API
+/* ======================================================
+   🔥 SMART POPULAR PRODUCTS API (ORACLE DB)
+   ====================================================== */
+/* ======================================================
+   🔥 SMART POPULAR PRODUCTS API (VIRAL LOGIC + ORACLE)
+   Priority: Reviews > Favorites > Views
+   ====================================================== */
 exports.getPopularProducts = async (req, res) => {
     try {
-        // 1. Get IDs of the most reviewed products
-        const [reviewedRows] = await db.reviews.query(
-            "SELECT product_id FROM product_ratings WHERE review_count > 0 ORDER BY review_count DESC LIMIT 40"
-        );
-        let popularIds = reviewedRows.map(r => String(r.product_id));
+        console.log("🟢 [ORACLE DB] Fetching VIRAL Popular Products...");
 
-        // 2. Fallback: If we have less than 40, fill with Most Viewed
-        if (popularIds.length < 40) {
-            const remainingNeeded = 40 - popularIds.length;
-            const viewedRes = await viewsClient.execute({
-                sql: `SELECT product_id FROM product_views ORDER BY views DESC LIMIT 80`, 
-                args: []
-            });
-            
-            const viewedIds = viewedRes.rows.map(v => String(v.product_id));
-            
-            // Merge lists and remove duplicates
-            popularIds = [...new Set([...popularIds, ...viewedIds])].slice(0, 40);
+        // 1. Get IDs of the most reviewed products
+        const [reviewedRows] = await db.reviews.query("SELECT product_id FROM product_ratings ORDER BY review_count DESC LIMIT 40");
+        const revIds = reviewedRows.map(r => String(r.product_id));
+
+        // 2. Get IDs of the most favorited products
+        let favIds = [];
+        if (db.db_social) {
+            try {
+                const [favRows] = await db.db_social.query("SELECT product_id, COUNT(*) as fav_count FROM product_favorites GROUP BY product_id ORDER BY fav_count DESC LIMIT 40");
+                favIds = favRows.map(r => String(r.product_id));
+            } catch(e) {}
         }
 
-        // 3. Fetch full product data from Turso
-        const rawProducts = await getProductsFromTursoByIds(popularIds);
-        
-        // 4. Transform to Lite Product Cards
-        const finalProducts = await constructProductCards(rawProducts);
+        // 3. Get IDs of most viewed products
+        let viewIds = [];
+        try {
+            const viewedRes = await viewsClient.execute({ sql: `SELECT product_id FROM product_views ORDER BY views DESC LIMIT 40`, args: [] });
+            viewIds = viewedRes.rows.map(v => String(v.product_id));
+        } catch(e) {}
 
-        // 5. 🔥 CACHE FOR 2 HOURS (7,200 seconds)
+        // Combine all Viral IDs (Remove Duplicates)
+        let popularIds = [...new Set([...revIds, ...favIds, ...viewIds])].slice(0, 60);
+
+        if (popularIds.length === 0) {
+            // Fallback agar koi viral data na ho
+            const fallback = await db.oracle.query("SELECT id FROM products WHERE status = 'in_stock' LIMIT 20");
+            popularIds = fallback.rows.map(r => String(r.id));
+        }
+
+        // 4. 🚨 FETCH PRODUCTS DIRECTLY FROM ORACLE
+        const rawProducts = await getProductsFromOracleByIds(popularIds);
+        
+        // Enrich Products
+        let enriched = await constructProductCards(rawProducts);
+
+        // Fetch exact favorites counts for these products
+        let favMap = new Map();
+        if (db.db_social && popularIds.length > 0) {
+            try {
+                const [fCounts] = await db.db_social.query("SELECT product_id, COUNT(*) as c FROM product_favorites WHERE product_id IN (?) GROUP BY product_id", [popularIds]);
+                fCounts.forEach(f => favMap.set(String(f.product_id), f.c));
+            } catch(e){}
+        }
+
+        // 5. 🔥 VIRAL SORTING ALGORITHM 🔥
+        enriched.forEach(p => p.favorites = favMap.get(String(p.id)) || 0);
+
+        enriched.sort((a, b) => {
+            // Priority 1: Reviews Count
+            if (b.review_count !== a.review_count) return b.review_count - a.review_count;
+            // Priority 2: Favorites Count
+            if (b.favorites !== a.favorites) return b.favorites - a.favorites;
+            // Priority 3: Views
+            return b.views - a.views;
+        });
+
+        const finalProducts = enriched.slice(0, 40); // Send Top 40 Viral Products
+
         res.setHeader('Cache-Control', 'public, s-maxage=7200, stale-while-revalidate=600');
         res.json(finalProducts);
 
     } catch (error) {
-        console.error("Popular Algorithm Error:", error);
-        res.status(200).json([]); // Return empty array so frontend doesn't crash
+        console.error("🔴 Oracle Popular Algorithm Error:", error.message);
+        res.status(200).json([]); 
     }
 };
-
 
 exports.getActiveStripBanners = async (req, res) => {
     try {
@@ -1529,3 +1314,36 @@ exports.getActiveStripBanners = async (req, res) => {
         res.status(500).json({ message: "Error fetching banners" });
     }
 };
+
+// Background Worker: Redis to Oracle
+const syncViewsToOracle = async () => {
+    try {
+        const data = await redis.hGetAll('product_views_buffer');
+        const ids = Object.keys(data);
+
+        if (ids.length === 0) return;
+
+        console.log(`\n☁️  [ORACLE SYNC] Moving ${ids.length} views from Redis to Database...`);
+
+        for (const id of ids) {
+            const count = parseInt(data[id]);
+            if (count > 0) {
+                // Oracle Query
+                await db.oracle.query(
+                    "UPDATE products SET views = COALESCE(views, 0) + $1 WHERE id = $2",
+                    [count, id]
+                );
+            }
+        }
+
+        await redis.del('product_views_buffer');
+        console.log("✅ [ORACLE SYNC] Success. Database is now updated.\n");
+
+    } catch (error) {
+        console.error("🔴 [ORACLE SYNC] Error:", error.message);
+    }
+};
+
+// 🕒 Timer: 5 minute = 300,000 milliseconds
+// Isay file ke end par check karein aur update kar dein:
+setInterval(syncViewsToOracle, 5 * 60 * 1000);

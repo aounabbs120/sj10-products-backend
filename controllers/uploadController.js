@@ -1,14 +1,14 @@
-// api/controllers/uploadController.js
 const sharp = require('sharp');
 const { PutObjectCommand } = require('@aws-sdk/client-s3');
-const r2ReviewClient = require('../config/r2ReviewClient'); // Reusing your existing R2 client
+const r2ReviewClient = require('../config/r2ReviewClient');
+const crypto = require('crypto'); // Built-in for unique IDs
 
 exports.uploadReviewImages = async (req, res) => {
     try {
-        // 1. Get Data from Body
         const { productId, orderId } = req.body;
         const files = req.files;
 
+        // 1. Basic Validation
         if (!files || files.length === 0) {
             return res.status(400).json({ message: "No images provided" });
         }
@@ -16,56 +16,60 @@ exports.uploadReviewImages = async (req, res) => {
             return res.status(400).json({ message: "Product ID and Order ID are required" });
         }
 
-        const uploadedUrls = [];
-        const now = new Date();
-        
-        // Generate Time Strings for URL
-        const dateStr = now.toISOString().split('T')[0]; // 2026-01-15
-        // Format time as HH-MM-SS
-        const timeStr = now.toTimeString().split(' ')[0].replace(/:/g, '-'); 
+        console.log(`📸 [UPLOAD] Processing ${files.length} images for Order: ${orderId}`);
 
-        // 2. Loop through files (Max 3)
-        // We use map to process them in parallel for speed
+        const now = new Date();
+        const dateStr = now.toISOString().split('T')[0]; // e.g., 2026-07-16
+        
+        // 2. Map and Process Files in Parallel
         const uploadPromises = files.map(async (file, index) => {
             
-            // A. Compress & Convert to WebP (720p Width)
+            // A. Unique Suffix (Taake filename kabhi takraye na)
+            const uniqueId = crypto.randomBytes(4).toString('hex');
+            const imageNumber = index + 1; 
+
+            // B. ⚡ SHARP ENGINE: Optimization & Auto-Rotate
             const optimizedBuffer = await sharp(file.buffer)
-                .resize({ width: 720, withoutEnlargement: true }) // Resize to 720p, don't stretch small images
-                .webp({ quality: 75 }) // Reduce quality slightly for storage savings (hardly visible)
+                .rotate() // 🚨 Mobile images ko auto-straight karta hai
+                .resize({ 
+                    width: 720, 
+                    height: 720, 
+                    fit: 'inside', // Aspect ratio kharab nahi karega
+                    withoutEnlargement: true 
+                })
+                .webp({ quality: 80, effort: 2 }) // Quality/Size ka balance
                 .toBuffer();
 
-            // B. Construct Unique Key
-            // Pattern: r2/products/{PROD}/order/{ORD}/image/{1,2,3}/{DATE}/{TIME}.webp
-            const imageNumber = index + 1; 
-            const fileName = `r2/products/${productId}/order/${orderId}/image/${imageNumber}/${dateStr}/${timeStr}.webp`;
+            // C. Path Construction
+            // Pattern: review-uploads/2026-07-16/order-ID/prod-ID-img-1-uuid.webp
+            const fileName = `review-uploads/${dateStr}/order-${orderId}/${productId}-img-${imageNumber}-${uniqueId}.webp`;
 
-            // C. Upload to R2
+            // D. Upload to Cloudflare R2
             await r2ReviewClient.send(new PutObjectCommand({
                 Bucket: process.env.R2_REVIEW_BUCKET_NAME,
                 Key: fileName,
                 Body: optimizedBuffer,
                 ContentType: 'image/webp',
-                // Optional: Cache control for browser (1 year) since URL is unique
                 CacheControl: 'public, max-age=31536000, immutable' 
             }));
 
-            // D. Generate Public URL
-            // Ensure R2_REVIEW_PUBLIC_URL in .env does NOT have a trailing slash
-            const publicUrl = `${process.env.R2_REVIEW_PUBLIC_URL}/${fileName}`;
-            return publicUrl;
+            // E. Public URL
+            return `${process.env.R2_REVIEW_PUBLIC_URL}/${fileName}`;
         });
 
-        // Wait for all uploads to finish
-        const results = await Promise.all(uploadPromises);
+        // 3. Execute all uploads together
+        const urls = await Promise.all(uploadPromises);
 
-        // 3. Return URLs to Frontend
+        console.log(`✅ [UPLOAD] Successfully moved ${urls.length} images to R2`);
+
         res.status(200).json({ 
-            message: "Images uploaded and optimized", 
-            urls: results 
+            success: true,
+            message: "Images processed and saved.", 
+            urls: urls 
         });
 
     } catch (error) {
-        console.error("Upload Error:", error);
-        res.status(500).json({ message: "Image upload failed" });
+        console.error("🔴 [Upload Controller] Critical Error:", error.message);
+        res.status(500).json({ success: false, message: "Server was unable to process images." });
     }
 };

@@ -1,33 +1,30 @@
 const db = require('../config/database');
-const { clients } = require('../config/tursoConnection'); 
 const axios = require('axios'); 
 
-// --- Helper: Fetch Product Details from Turso ---
-const getProductsByIds = async (productIds) => {
+// --- 🎯 HELPER: Fetch Product Details from Oracle (Lightning Fast) ---
+const getProductsFromOracleByIds = async (productIds) => {
     if (!productIds || productIds.length === 0) return [];
-    if (!clients || Object.keys(clients).length === 0) return [];
-    
-    // 🔥 FIXED: Added discounted_price and supplier_id to the query
-    const promises = Object.values(clients).map(async (client) => {
-        try {
-            const placeholders = productIds.map(() => '?').join(',');
-            const sql = `SELECT id, title, image_urls, price, discounted_price, slug, supplier_id FROM products WHERE id IN (${placeholders})`;
-            const res = await client.execute({ sql, args: productIds });
-            return res.rows;
-        } catch (e) { return []; }
-    });
-
-    const results = await Promise.all(promises);
-    return results.flat(); 
+    try {
+        console.log(`🟢 [ORACLE DB] Fetching details for ${productIds.length} favorited products...`);
+        
+        // Postgres uses $1, $2 placeholders
+        const placeholders = productIds.map((_, i) => `$${i + 1}`).join(',');
+        const sql = `SELECT id, title, image_urls, image_url, price, discounted_price, slug, supplier_id FROM products WHERE id IN (${placeholders})`;
+        
+        const res = await db.oracle.query(sql, productIds);
+        return res.rows || [];
+    } catch (e) { 
+        console.error("🔴 Oracle Social Helper Error:", e.message);
+        return []; 
+    }
 };
 
-// --- 1. Get My Favorites ---
+// --- 1. GET MY FAVORITES ---
 exports.getMyFavorites = async (req, res) => {
     try {
         const userId = req.user.id;
-        if (!db.db_social) return res.status(500).json({ message: "DB Error" });
 
-        // 1. Get IDs from MySQL
+        // 1. Get IDs from TiDB MySQL (Social DB)
         const [favRows] = await db.db_social.query(
             "SELECT product_id, created_at FROM product_favorites WHERE user_id = ? ORDER BY created_at DESC", 
             [userId]
@@ -35,45 +32,43 @@ exports.getMyFavorites = async (req, res) => {
 
         if (!favRows || favRows.length === 0) return res.json([]);
 
-        // 2. Get Details from Turso
+        // 2. Get Details from Oracle (Instead of 12 Turso Shards)
         const productIds = favRows.map(row => row.product_id);
-        const products = await getProductsByIds(productIds);
+        const products = await getProductsFromOracleByIds(productIds);
 
-        // 3. Merge Data
+        // 3. Merge Data & Parse Images
         const detailedFavorites = products.map(p => {
             const favInfo = favRows.find(f => String(f.product_id) === String(p.id)); 
             
-            // Image Parsing
+            // Robust Image Parsing
             let images = [];
             try { 
-                images = typeof p.image_urls === 'string' ? JSON.parse(p.image_urls) : p.image_urls; 
-            } catch (e) { 
-                images = ["/placeholder.jpg"]; 
-            }
+                if (Array.isArray(p.image_urls)) images = p.image_urls;
+                else if (typeof p.image_urls === 'string' && p.image_urls.startsWith('[')) images = JSON.parse(p.image_urls);
+                else images = [p.image_url || p.image_urls].filter(Boolean);
+            } catch (e) { images = ["/placeholder.jpg"]; }
 
             return { 
                 ...p, 
-                // Ensure numbers for frontend math
-                price: parseFloat(p.price),
-                discounted_price: parseFloat(p.discounted_price || p.price),
+                price: parseFloat(p.price || 0),
+                discounted_price: parseFloat(p.discounted_price || p.price || 0),
                 image_urls: images, 
                 favorited_at: favInfo ? favInfo.created_at : null 
             };
         });
 
-        // 4. Sort again by favorited_at to ensure correct order after merging
+        // 4. Final Sort (TIDB order maintain rakhne ke liye)
         detailedFavorites.sort((a, b) => new Date(b.favorited_at) - new Date(a.favorited_at));
 
         res.json(detailedFavorites);
     } catch (error) {
-        console.error("Favorites Error:", error);
+        console.error("🔴 Favorites List Error:", error.message);
         res.status(500).json({ message: "Error fetching favorites" });
     }
 };
 
-// --- 2. Toggle Favorite ---
+// --- 2. TOGGLE FAVORITE ---
 exports.toggleFavoriteProduct = async (req, res) => {
-    if (!db.db_social) return res.status(500).json({ message: "DB Error" });
     const connection = await db.db_social.getConnection();
     try {
         const userId = req.user.id;
@@ -92,17 +87,16 @@ exports.toggleFavoriteProduct = async (req, res) => {
             res.json({ message: "Added to favorites", isFavorite: true });
         }
     } catch (error) {
-        await connection.rollback();
+        if(connection) await connection.rollback();
         res.status(500).json({ message: "Action failed" });
     } finally {
         connection.release();
     }
 };
 
-// --- 3. Check Status ---
+// --- 3. CHECK FAVORITE STATUS ---
 exports.checkFavoriteStatus = async (req, res) => {
     try {
-        if (!db.db_social) return res.json({ isFavorite: false });
         const [rows] = await db.db_social.query("SELECT id FROM product_favorites WHERE user_id = ? AND product_id = ?", [req.user.id, req.params.productId]);
         res.json({ isFavorite: rows.length > 0 });
     } catch (error) {
@@ -110,11 +104,10 @@ exports.checkFavoriteStatus = async (req, res) => {
     }
 };
 
-// --- 4. Follow Logic ---
+// --- 4. FOLLOW SUPPLIER LOGIC ---
 exports.toggleFollowSupplier = async (req, res) => {
-    let connection;
+    const connection = await db.db_social.getConnection();
     try {
-        connection = await db.db_social.getConnection();
         await connection.beginTransaction();
 
         const userId = req.user.id;
@@ -145,7 +138,7 @@ exports.toggleFollowSupplier = async (req, res) => {
             );
             isFollowing = true;
 
-            // Notification
+            // Optional: Internal Notification to Supplier
             if (process.env.SUPPLIER_BACKEND_URL && db.users) {
                 const [userDetails] = await db.users.query("SELECT full_name, profile_pic FROM users WHERE id = ?", [userId]);
                 const followerName = (userDetails.length > 0) ? userDetails[0].full_name : "A Customer";
@@ -156,7 +149,7 @@ exports.toggleFollowSupplier = async (req, res) => {
                     followerName,
                     followerPic
                 }, { headers: { 'x-internal-api-key': process.env.INTERNAL_API_KEY } })
-                .catch(e => console.log("Notification Skipped"));
+                .catch(e => { /* Silently fail notification */ });
             }
         }
 
@@ -165,10 +158,10 @@ exports.toggleFollowSupplier = async (req, res) => {
 
     } catch (error) {
         if(connection) await connection.rollback();
-        console.error("Follow Error:", error);
+        console.error("🔴 Follow Error:", error.message);
         res.status(500).json({ message: "Action failed" });
     } finally {
-        if(connection) connection.release();
+        connection.release();
     }
 };
 
