@@ -1,8 +1,16 @@
 require('dotenv').config();
 const db = require('../config/database');
 const redis = require('../config/redis'); 
-const { viewsClient, clients } = require('../config/tursoConnection');
 
+const meiliPkg = require('meilisearch');
+const MeiliSearch = meiliPkg.Meilisearch || meiliPkg.MeiliSearch || meiliPkg.default || meiliPkg;
+
+
+
+const meiliClient = new MeiliSearch({
+    host: 'http://129.159.225.126:7700',
+    apiKey: 'Sj10MeiliSuperKey2026'
+});
 // --- HELPER: Parse Product ---
 const parseProduct = (p) => {
     if (!p) return null;
@@ -138,8 +146,8 @@ const constructProductCards = async (rawProducts) => {
     }
 };
 /* ======================================================
-   🔥 SMART SEARCH RESULTS (ORACLE POSTGRES)
-   Priority: SKU Match > Title Match > Description
+   🔥 SMART SEARCH RESULTS (MEILISEARCH + ORACLE POSTGRES FALLBACK)
+   Features: Millisecond Search, Typo-Tolerance, Bulletproof DB Fallback
    ====================================================== */
 exports.getSearchResults = async (req, res) => {
     try {
@@ -150,59 +158,69 @@ exports.getSearchResults = async (req, res) => {
 
         if (!q) return res.json({ products: [], totalCount: 0 });
 
-        console.log(`🟢 [ORACLE DB] Main Search Request: "${q}"`);
+        console.log(`🔍 [SEARCH] Query received: "${q}"`);
 
-        // 1. Fetch Promoted IDs from TiDB (MySQL)
+        // Promoted IDs from MySQL (TiDB)
         const [pRows] = await db.inventory.query(
             "SELECT product_id FROM promoted_products WHERE payment_status = 'paid' AND start_date <= NOW() AND end_date >= NOW()"
         );
         const promotedIds = new Set(pRows.map(r => String(r.product_id)));
 
-        // 2. Build Smart Oracle (Postgres) Query
-        const searchPattern = `%${q.trim().toLowerCase()}%`;
-        
-        // Postgres Relevance logic: SKU matches are weighted higher than title
-        const sql = `
-            SELECT *, 
-            (CASE WHEN sku ILIKE $1 THEN 10 ELSE 0 END) + 
-            (CASE WHEN title ILIKE $1 THEN 5 ELSE 0 END) +
-            (CASE WHEN description ILIKE $1 THEN 1 ELSE 0 END) as relevance_score
-            FROM products 
-            WHERE status = 'in_stock' AND (title ILIKE $1 OR sku ILIKE $1 OR description ILIKE $1)
-            ORDER BY relevance_score DESC, created_at DESC
-            LIMIT $2 OFFSET $3
-        `;
+        let productIds = [];
+        let totalCount = 0;
 
-        const [result, countRes] = await Promise.all([
-            db.oracle.query(sql, [searchPattern, limit, offset]),
-            db.oracle.query("SELECT COUNT(*) as total FROM products WHERE status = 'in_stock' AND (title ILIKE $1 OR sku ILIKE $1 OR description ILIKE $1)", [searchPattern])
-        ]);
+        try {
+            // 🚨 STRATEGY A: Query Meilisearch (Typo-Tolerant, Instant)
+            console.log("🏎️ [MEILISEARCH] Querying Meilisearch Engine...");
+            const index = meiliClient.index('products');
+            const searchRes = await index.search(q, {
+                limit: limit,
+                offset: offset,
+                attributesToRetrieve: ['id'] // We only need IDs, full data comes from Postgres
+            });
 
-        // 3. Enrich Results (Badges, Ratings from construction helper)
-        const enrichedProducts = await constructProductCards(result.rows);
+            productIds = searchRes.hits.map(hit => hit.id);
+            totalCount = searchRes.estimatedTotalHits;
+            console.log(`✅ [MEILISEARCH] Found ${productIds.length} matches.`);
 
-        // 4. Mark Promoted Flag for Frontend
+        } catch (meiliError) {
+            // 🚨 STRATEGY B: PostgreSQL Fallback (If Meilisearch is offline)
+            console.warn("⚠️ [MEILISEARCH] Offline! Falling back to Postgres ILIKE query...");
+            const searchPattern = `%${q.trim().toLowerCase()}%`;
+            const sql = `
+                SELECT id FROM products 
+                WHERE status = 'in_stock' AND (title ILIKE $1 OR sku ILIKE $1)
+                ORDER BY created_at DESC LIMIT $2 OFFSET $3
+            `;
+            const countSql = "SELECT COUNT(*) FROM products WHERE status = 'in_stock' AND (title ILIKE $1 OR sku ILIKE $1)";
+            
+            const [dbRes, dbCount] = await Promise.all([
+                db.oracle.query(sql, [searchPattern, limit, offset]),
+                db.oracle.query(countSql, [searchPattern])
+            ]);
+
+            productIds = dbRes.rows.map(r => r.id);
+            totalCount = parseInt(dbCount.rows[0].count);
+        }
+
+        if (productIds.length === 0) {
+            return res.json({ products: [], totalCount: 0 });
+        }
+
+        // Fetch full product details from Oracle Postgres using IDs
+        const rawProducts = await getProductsFromOracleByIds(productIds);
+        const enrichedProducts = await constructProductCards(rawProducts);
+
+        // Mark Promoted Flag
         const finalWithFlag = enrichedProducts.map(p => ({
             ...p,
             is_promoted: promotedIds.has(String(p.id))
         }));
 
-        // 5. Auto-Learn Keyword (Track in TiDB MySQL)
-        if (page === 1 && finalWithFlag.length > 0) {
-            const safeKeyword = q.trim().toLowerCase();
-            db.inventory.query(`
-                INSERT INTO search_keywords (keyword, search_count) VALUES (?, 1) 
-                ON DUPLICATE KEY UPDATE search_count = search_count + 1
-            `, [safeKeyword]).catch(()=>{});
-        }
-
-        res.json({ 
-            products: finalWithFlag, 
-            totalCount: parseInt(countRes.rows[0].total || 0) 
-        });
+        res.json({ products: finalWithFlag, totalCount });
 
     } catch (e) {
-        console.error("🔴 Oracle Search Error:", e.message);
+        console.error("🔴 Search API Master Error:", e.message);
         res.status(500).json({ products: [], totalCount: 0 });
     }
 };
@@ -1221,73 +1239,73 @@ exports.getBanners = async (req, res) => {
 };
 
 /* ======================================================
-   🔥 SMART POPULAR PRODUCTS API (ORACLE DB)
-   ====================================================== */
-/* ======================================================
-   🔥 SMART POPULAR PRODUCTS API (VIRAL LOGIC + ORACLE)
-   Priority: Reviews > Favorites > Views
+   🔥 SMART POPULAR PRODUCTS API (VIRAL LOGIC + ORACLE DB)
+   Priority: Reviews (Proxy for Sales) > Favorites > Views
+   Features: Zero Turso Hits, Highly Scalable, Postgres Optimized
    ====================================================== */
 exports.getPopularProducts = async (req, res) => {
     try {
-        console.log("🟢 [ORACLE DB] Fetching VIRAL Popular Products...");
+        console.log("🟢 [ORACLE DB] Fetching VIRAL & POPULAR Products...");
 
-        // 1. Get IDs of the most reviewed products
-        const [reviewedRows] = await db.reviews.query("SELECT product_id FROM product_ratings ORDER BY review_count DESC LIMIT 40");
+        // 1. Get IDs of the most reviewed products from TiDB MySQL (Proxy for High Sales)
+        const [reviewedRows] = await db.reviews.query("SELECT product_id FROM product_ratings ORDER BY review_count DESC LIMIT 45");
         const revIds = reviewedRows.map(r => String(r.product_id));
 
-        // 2. Get IDs of the most favorited products
+        // 2. Get IDs of the most favorited products from TiDB MySQL (Social DB)
         let favIds = [];
-        if (db.db_social) {
+        if (db.social) {
             try {
-                const [favRows] = await db.db_social.query("SELECT product_id, COUNT(*) as fav_count FROM product_favorites GROUP BY product_id ORDER BY fav_count DESC LIMIT 40");
+                const [favRows] = await db.social.query("SELECT product_id, COUNT(*) as fav_count FROM product_favorites GROUP BY product_id ORDER BY fav_count DESC LIMIT 45");
                 favIds = favRows.map(r => String(r.product_id));
-            } catch(e) {}
+            } catch(e) { console.error("Social DB Query Warning:", e.message); }
         }
 
-        // 3. Get IDs of most viewed products
+        // 3. 🚨 CORE FIX: Get IDs of most viewed products from Oracle Postgres (Bypasses viewsClient)
         let viewIds = [];
         try {
-            const viewedRes = await viewsClient.execute({ sql: `SELECT product_id FROM product_views ORDER BY views DESC LIMIT 40`, args: [] });
-            viewIds = viewedRes.rows.map(v => String(v.product_id));
-        } catch(e) {}
+            const viewedRes = await db.oracle.query("SELECT id FROM products WHERE status = 'in_stock' ORDER BY views DESC LIMIT 45");
+            viewIds = viewedRes.rows.map(v => String(v.id));
+        } catch(e) { console.error("Oracle Views Query Warning:", e.message); }
 
-        // Combine all Viral IDs (Remove Duplicates)
+        // Combine all unique IDs
         let popularIds = [...new Set([...revIds, ...favIds, ...viewIds])].slice(0, 60);
 
         if (popularIds.length === 0) {
-            // Fallback agar koi viral data na ho
-            const fallback = await db.oracle.query("SELECT id FROM products WHERE status = 'in_stock' LIMIT 20");
+            // Fallback to latest products if no stats exist
+            const fallback = await db.oracle.query("SELECT id FROM products WHERE status = 'in_stock' ORDER BY created_at DESC LIMIT 40");
             popularIds = fallback.rows.map(r => String(r.id));
         }
 
-        // 4. 🚨 FETCH PRODUCTS DIRECTLY FROM ORACLE
+        // 4. Fetch Products directly from Oracle PostgreSQL (Server 1)
         const rawProducts = await getProductsFromOracleByIds(popularIds);
         
-        // Enrich Products
+        // Enrich Products using our optimized cards constructor
         let enriched = await constructProductCards(rawProducts);
 
-        // Fetch exact favorites counts for these products
+        // Fetch exact favorites counts for these products from TiDB (Social DB)
         let favMap = new Map();
-        if (db.db_social && popularIds.length > 0) {
+        if (db.social && popularIds.length > 0) {
             try {
-                const [fCounts] = await db.db_social.query("SELECT product_id, COUNT(*) as c FROM product_favorites WHERE product_id IN (?) GROUP BY product_id", [popularIds]);
+                const [fCounts] = await db.social.query("SELECT product_id, COUNT(*) as c FROM product_favorites WHERE product_id IN (?) GROUP BY product_id", [popularIds]);
                 fCounts.forEach(f => favMap.set(String(f.product_id), f.c));
             } catch(e){}
         }
 
-        // 5. 🔥 VIRAL SORTING ALGORITHM 🔥
+        // Apply Favorites counts to products for sorting
         enriched.forEach(p => p.favorites = favMap.get(String(p.id)) || 0);
 
+        // 5. 🔥 THE ULTIMATE POPULARITY SORTING ALGORITHM 🔥
         enriched.sort((a, b) => {
-            // Priority 1: Reviews Count
+            // Priority 1: Reviews Count (Best proxy for high sales)
             if (b.review_count !== a.review_count) return b.review_count - a.review_count;
-            // Priority 2: Favorites Count
+            // Priority 2: Favorites Count (Highly desired)
             if (b.favorites !== a.favorites) return b.favorites - a.favorites;
-            // Priority 3: Views
+            // Priority 3: Views (Most Viral)
             return b.views - a.views;
         });
 
-        const finalProducts = enriched.slice(0, 40); // Send Top 40 Viral Products
+        // Slice to return top 40 highly popular and sold products
+        const finalProducts = enriched.slice(0, 40);
 
         res.setHeader('Cache-Control', 'public, s-maxage=7200, stale-while-revalidate=600');
         res.json(finalProducts);
@@ -1297,7 +1315,6 @@ exports.getPopularProducts = async (req, res) => {
         res.status(200).json([]); 
     }
 };
-
 exports.getActiveStripBanners = async (req, res) => {
     try {
         const [rows] = await db.inventory.query(
