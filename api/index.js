@@ -92,7 +92,42 @@ const exploitAndBotScanner = (req, res, next) => {
     next();
 };
 app.use(exploitAndBotScanner);
+// ==========================================================
+// 📊 REAL-TIME PULSE-CHECK FOR MONITORING (P1 & P2 ONLY)
+// ==========================================================
+const os = require('os');
+const { execSync } = require('child_process');
 
+app.get('/api/internal/pulse-check', (req, res) => {
+    // Security Key check
+    if (req.headers['x-internal-api-key'] !== "Pakistanc456") {
+        return res.status(403).send("Forbidden");
+    }
+    try {
+        const disk = execSync("df -h / | tail -1 | awk '{print $2,$3,$4,$5}'").toString().trim().split(/\s+/);
+        const totalMem = os.totalmem();
+        const freeMem = os.freemem();
+        const usedMem = totalMem - freeMem;
+        
+        res.json({
+            cpu: `${os.loadavg()[0].toFixed(2)}%`,
+            ram: {
+                total: `${(totalMem / 1024/1024/1024).toFixed(2)} GB`,
+                used: `${(usedMem / 1024/1024/1024).toFixed(2)} GB`,
+                percent: Math.round((usedMem / totalMem) * 100)
+            },
+            disk: {
+                total: disk[0] || 'N/A',
+                used: disk[1] || 'N/A',
+                available: disk[2] || 'N/A',
+                percent: disk[3] || 'N/A'
+            },
+            uptime: `${(os.uptime() / 3600).toFixed(1)} Hours`
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 // ==========================================================
 // 🚥 4. RATE LIMITER (With Auto-Ban for Spammers)
 // ==========================================================
