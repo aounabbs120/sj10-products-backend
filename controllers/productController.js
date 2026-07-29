@@ -363,89 +363,127 @@ exports.getProductStats = async (req, res) => {
 };
 
 /* ======================================================
-   📦 HOMEPAGE MASTER BUNDLE (ORACLE + TiDB)
-   Used by: getStaticHomeData() in frontend
+   📦 HOMEPAGE MASTER BUNDLE (ORACLE + TiDB + REDIS)
    ====================================================== */
 exports.getHomepageData = async (req, res) => {
-    // 🔥 YEH LOG SAB SE OOPAR HAI
-    console.log("📡 [REQUEST] Frontend calling: getHomepageData (Homepage Bundle)");
+    // 🔥 Cache Key 'v7' kar di hai taake purana kharab cache clear ho jaye
+    const cacheKey = "homepage_master_cache_v7"; 
     
-    const cacheKey = "homepage_master_cache_v5";
     try {
-        const cached = await redis.get(cacheKey);
-        if (cached) {
-            console.log("⚡ [REDIS] Homepage data served from Cache (No DB hit)");
-            return res.json(JSON.parse(cached));
+        // ==========================================
+        // 🛡️ 1. REDIS CACHE CHECK (SUPER FAST & SAFE)
+        // ==========================================
+        if (redis && typeof redis.get === 'function') {
+            try {
+                const cached = await redis.get(cacheKey);
+                if (cached) {
+                    console.log("⚡ [REDIS] Homepage data served instantly from Cache");
+                    return res.json(JSON.parse(cached));
+                }
+            } catch (redisErr) {
+                console.warn("⚠️ [REDIS WARNING] Could not read from Redis, moving to DB.");
+            }
         }
 
-        console.log("🟢 [ORACLE DB] Cache Miss! Fetching Promoted, Popular & Latest from Oracle...");
+        console.log("🟢 [DB FETCH] Cache Miss! Fetching Homepage Bundle from Databases...");
 
-        // 2. Fetch IDs from TiDB MySQL (Phase 1)
+        // ==========================================
+        // 🛡️ 2. FETCH FROM TiDB / MYSQL (100% CRASH PROOF)
+        // Agar db connect na ho tab bhi Promise.resolve se empty array bhej dega
+        // ==========================================
         const [bannersRes, catsRes, promotedRows, topReviewedRows, topFavoritedRows] = await Promise.all([
-            db.inventory.query("SELECT id, image_url, link_url FROM banners WHERE is_active = 1"),
-            db.inventory.query("SELECT id, name, image_url, slug, parent_id FROM categories ORDER BY name ASC"),
-            db.inventory.query("SELECT product_id FROM promoted_products WHERE payment_status = 'paid' AND start_date <= NOW() AND end_date >= NOW() ORDER BY start_date DESC LIMIT 50"),
-            db.reviews.query("SELECT product_id FROM product_ratings ORDER BY review_count DESC LIMIT 50"),
-            db.db_social ? db.db_social.query("SELECT product_id, COUNT(*) as f_count FROM product_favorites GROUP BY product_id ORDER BY f_count DESC LIMIT 50").catch(()=>[[]]) : [[ ]]
+            db.inventory ? db.inventory.query("SELECT id, image_url, link_url FROM banners WHERE is_active = 1").catch(() => [[ ]]) : Promise.resolve([[ ]]),
+            db.inventory ? db.inventory.query("SELECT id, name, image_url, slug, parent_id FROM categories ORDER BY name ASC").catch(() => [[ ]]) : Promise.resolve([[ ]]),
+            db.inventory ? db.inventory.query("SELECT product_id FROM promoted_products WHERE payment_status = 'paid' AND start_date <= NOW() AND end_date >= NOW() ORDER BY start_date DESC LIMIT 50").catch(() => [[ ]]) : Promise.resolve([[ ]]),
+            db.reviews ? db.reviews.query("SELECT product_id FROM product_ratings ORDER BY review_count DESC LIMIT 50").catch(() => [[ ]]) : Promise.resolve([[ ]]),
+            db.db_social ? db.db_social.query("SELECT product_id, COUNT(*) as f_count FROM product_favorites GROUP BY product_id ORDER BY f_count DESC LIMIT 50").catch(()=>[[ ]]) : Promise.resolve([[ ]])
         ]);
 
-        // 3. Fetch Most Viewed IDs from Oracle Postgres (Phase 2)
-        const topViewedRes = await db.oracle.query("SELECT id FROM products WHERE status = 'in_stock' ORDER BY views DESC LIMIT 50");
+        // ==========================================
+        // 🛡️ 3. ORACLE POSTGRES QUERIES
+        // ==========================================
+        let topViewedRes = { rows: [] };
+        if (db.oracle) {
+            try { 
+                topViewedRes = await db.oracle.query("SELECT id FROM products WHERE status = 'in_stock' ORDER BY views DESC LIMIT 50"); 
+            } catch(e) {
+                console.warn("⚠️ Oracle views fetch failed:", e.message);
+            }
+        }
 
-        // --- 🎯 SMART ID MERGING (Ensuring 50 products) ---
+        // --- 🎯 SMART ID MERGING FOR POPULAR PRODUCTS ---
         const promotedIds = [...new Set((promotedRows[0] || []).map(r => String(r.product_id)))];
-        
-        // Combine Reviewed, Favorited, and Most Viewed
         const viralIdsPool = [
             ...(topReviewedRows[0] || []).map(r => String(r.product_id)),
             ...(topFavoritedRows[0] || []).map(r => String(r.product_id)),
             ...(topViewedRes.rows || []).map(r => String(r.id))
         ];
-
-        // Unique IDs nikal kar top 60 pakrain taake fetch ke baad 50 perfect milen
+        // Sirf top 60 unique viral IDs utha rahay hain
         const finalViralIds = [...new Set(viralIdsPool)].slice(0, 60);
 
-        // 4. 🚨 FETCH DATA FROM ORACLE
-        const [promotedRaw, viralRaw, latestRaw] = await Promise.all([
-            getProductsFromOracleByIds(promotedIds),
-            getProductsFromOracleByIds(finalViralIds),
-            db.oracle.query("SELECT * FROM products WHERE status = 'in_stock' ORDER BY created_at DESC LIMIT 50")
-        ]);
+        // ==========================================
+        // 🛡️ 4. FETCH FULL DETAILS FROM ORACLE
+        // ==========================================
+        let promotedRaw = [], viralRaw = [], latestRaw = { rows: [] };
+        if (db.oracle) {
+            try {
+                [promotedRaw, viralRaw, latestRaw] = await Promise.all([
+                    getProductsFromOracleByIds(promotedIds).catch(() => []),
+                    getProductsFromOracleByIds(finalViralIds).catch(() => []),
+                    db.oracle.query("SELECT * FROM products WHERE status = 'in_stock' ORDER BY created_at DESC LIMIT 50").catch(() => ({ rows: [] }))
+                ]);
+            } catch(e) {
+                console.warn("⚠️ Oracle Product Detail Fetch failed:", e.message);
+            }
+        }
 
-        // 5. Enrich all products
+        // ==========================================
+        // 🛡️ 5. ENRICH PRODUCTS (Attach badges, suppliers, etc)
+        // ==========================================
         const [promotedTop50, viralEnriched, latestProducts] = await Promise.all([
-            constructProductCards(promotedRaw),
-            constructProductCards(viralRaw),
-            constructProductCards(latestRaw.rows)
+            constructProductCards(promotedRaw || []),
+            constructProductCards(viralRaw || []),
+            constructProductCards(latestRaw.rows || [])
         ]);
 
-        // --- 🔥 VIRAL SORTING ALGORITHM (Reviews > Favorites > Views) ---
-        const popularProducts = viralEnriched.sort((a, b) => {
-            if (b.review_count !== a.review_count) return b.review_count - a.review_count; // P1: Reviews
-            // Favorites logic inside cards (default to views if equal)
-            return b.views - a.views; 
-        }).slice(0, 50); // Exact 50 products for Popular Section
+        // --- 🔥 POPULAR SORTING LOGIC (Safely handled) ---
+        const popularProducts = (viralEnriched || []).sort((a, b) => {
+            if (b.review_count !== a.review_count) return (b.review_count || 0) - (a.review_count || 0);
+            return (b.views || 0) - (a.views || 0); 
+        }).slice(0, 50);
 
         const subCategoriesAll = (catsRes[0] || []).filter(cat => cat.parent_id);
 
+        // ==========================================
+        // 🛡️ 6. FINAL RESPONSE BUNDLE
+        // ==========================================
         const response = {
             banners: bannersRes[0] || [],
-            subCatRow1: subCategoriesAll,
-            promotedTop50: promotedTop50,
-            popularProducts: popularProducts, 
-            latestProducts: latestProducts 
+            subCatRow1: subCategoriesAll || [],
+            promotedTop50: promotedTop50 || [],
+            popularProducts: popularProducts || [], 
+            latestProducts: latestProducts || []
         };
 
-        // Cache in Redis for 10 mins
-        await redis.setEx(cacheKey, 600, JSON.stringify(response));
+        // ==========================================
+        // 🛡️ 7. SAVE TO REDIS CACHE FOR 10 MINUTES
+        // ==========================================
+        if (redis && typeof redis.setEx === 'function') {
+            try {
+                await redis.setEx(cacheKey, 600, JSON.stringify(response));
+                console.log(`✅ [REDIS] Homepage Bundle Cached successfully.`);
+            } catch (redisSetErr) {
+                console.warn("⚠️ [REDIS WARNING] Failed to save cache.");
+            }
+        }
 
-        console.log(`✅ [ORACLE DB] Homepage Bundle Ready. Promoted: ${promotedTop50.length}, Popular Viral: ${popularProducts.length}`);
-        
-        res.json(response);
+        console.log(`✅ [DB SUCCESS] Homepage Bundle Sent to Frontend. Promoted: ${promotedTop50.length}, Popular: ${popularProducts.length}`);
+        return res.json(response);
 
     } catch (error) {
-        console.error("🔴 Oracle Homepage Error:", error);
-        res.status(500).json({ banners: [], promotedTop50: [], popularProducts: [], latestProducts: [] });
+        console.error("🔴 CRITICAL Oracle Homepage Master Error:", error);
+        // Fallback: Agar kisi wajah se poora block gir jaye, toh API frontend ko blank data bhej degi crash ki bajaye
+        return res.json({ banners: [], subCatRow1: [], promotedTop50: [], popularProducts: [], latestProducts: [] });
     }
 };
 exports.getHomepageCategories = async (req, res) => {
