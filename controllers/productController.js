@@ -570,10 +570,9 @@ exports.getSearchSuggestions = async (req, res) => {
         res.json([]); 
     }
 };
-
-/* ======================================================
-   🔥 SMART GET PRODUCT BY SLUG (ORACLE + REDIS VIEWS)
-   ====================================================== */
+// ======================================================
+// 🔥 SMART GET PRODUCT BY SLUG (100% NEXT.JS PAGE.TSX COMPATIBLE)
+// ======================================================
 exports.getProductBySlug = async (req, res) => {
     try {
         const rawParam = req.params.slug || '';
@@ -582,15 +581,30 @@ exports.getProductBySlug = async (req, res) => {
             return res.status(400).json({ message: "Invalid slug" });
         }
 
-        console.log(`🔍 [ORACLE DB] Main Search: ${decodedParam}`);
+        const productCacheKey = `product_${decodedParam}`;
+        const CACHE_HEADER = 'public, max-age=3600';
 
-        // 1. Fetch Product from Oracle
+        // 1. ⚡ CHECK REDIS PERMANENT CACHE FIRST
+        const cachedProduct = await redis.get(productCacheKey);
+        if (cachedProduct) {
+            console.log(`⚡ [REDIS HIT] Serving Product "${decodedParam}" from Cache`);
+            
+            // Background View Increment
+            await redis.hIncrBy('product_views_buffer', JSON.parse(cachedProduct).id, 1);
+            
+            res.setHeader('Cache-Control', CACHE_HEADER);
+            return res.json(JSON.parse(cachedProduct));
+        }
+
+        console.log(`🟢 [ORACLE DB] Cache Miss! Fetching Product "${decodedParam}" from Postgres...`);
+
+        // 2. Fetch Product from Oracle Postgres (Server 1)
         let result = await db.oracle.query(
-            "SELECT * FROM products WHERE id = $1 OR slug = $1 LIMIT 1", 
+            "SELECT id, supplier_id, category_id, title, description, price, discounted_price, quantity, status, sku, slug, image_url, image_urls, video_url, package_information, colors, sizes, season FROM products WHERE id = $1 OR slug = $1 LIMIT 1", 
             [decodedParam]
         );
 
-        // Smart SKU Peeling (If not found)
+        // Smart SKU Peeling Fallback
         if (result.rows.length === 0 && decodedParam.includes('-')) {
             const parts = decodedParam.split('-');
             const lastPart = parts[parts.length - 1];
@@ -599,7 +613,7 @@ exports.getProductBySlug = async (req, res) => {
             const peeledSlug = parts.slice(0, parts.length - 2).join('-');
 
             result = await db.oracle.query(
-                "SELECT * FROM products WHERE sku = $1 OR sku = $2 OR slug = $3 OR id = $2 LIMIT 1", 
+                "SELECT id, supplier_id, category_id, title, description, price, discounted_price, quantity, status, sku, slug, image_url, image_urls, video_url, package_information, colors, sizes, season FROM products WHERE sku = $1 OR sku = $2 OR slug = $3 OR id = $2 LIMIT 1", 
                 [fullSku, lastPart, peeledSlug]
             );
         }
@@ -608,40 +622,87 @@ exports.getProductBySlug = async (req, res) => {
 
         const product = result.rows[0];
 
-        // 2. 🚨 REAL-TIME VIEWS (Oracle DB + Redis Buffer)
+        // 3. Calculate Views atomic count
         const dbViews = parseInt(product.views || 0);
         const bufferViews = parseInt(await redis.hGet('product_views_buffer', String(product.id)) || 0);
         const totalViews = dbViews + bufferViews;
 
-        // 3. Parallel Data Fetching
+        // 4. ⚡ PARALLEL DATA FETCHING
         const [varRes, supRes, revRes, relRes, catRes, promotedRes, favCountRes] = await Promise.all([
-            db.oracle.query("SELECT * FROM variants WHERE product_id = $1", [product.id]), 
-            db.suppliers.query("SELECT id, brand_name, profile_pic, verified_status, supplier_code, average_rating, followers_count, total_products, city FROM suppliers WHERE id = ?", [product.supplier_id]),
-            db.reviews.query("SELECT * FROM reviews WHERE product_id = ? ORDER BY created_at DESC LIMIT 10", [product.id]),
-            db.oracle.query("SELECT * FROM products WHERE category_id = $1 AND id != $2 AND status='in_stock' LIMIT 8", [product.category_id, product.id]),
-            db.inventory.query("SELECT c1.name as sub_name, c1.slug as sub_slug, c2.name as parent_name, c2.slug as parent_slug FROM categories c1 LEFT JOIN categories c2 ON c1.parent_id = c2.id WHERE c1.id = ?", [product.category_id]),
-            db.inventory.query("SELECT id FROM promoted_products WHERE product_id = ? AND payment_status='paid' AND end_date > NOW()", [product.id]),
-            db.db_social ? db.db_social.query("SELECT COUNT(*) as total FROM product_favorites WHERE product_id = ?", [product.id]) : Promise.resolve([{total: 0}])
+            db.oracle.query("SELECT id, custom_color as color, custom_size as size, price, stock, image_url as image FROM variants WHERE product_id = $1", [product.id]), 
+            db.suppliers.query("SELECT id, brand_name, profile_pic, verified_status, supplier_code, average_rating, followers_count, total_products, city FROM suppliers WHERE LOWER(TRIM(id)) = LOWER(TRIM(?)) LIMIT 1", [String(product.supplier_id || '').trim()]),
+            db.reviews.query("SELECT id, user_name, rating, comment, created_at FROM reviews WHERE product_id = ? ORDER BY created_at DESC LIMIT 10", [product.id]),
+            db.oracle.query("SELECT id, title, slug, sku, price, discounted_price, image_url, image_urls, video_url, supplier_id FROM products WHERE category_id = $1 AND id != $2 AND status='in_stock' LIMIT 8", [product.category_id || '0', product.id]),
+            db.inventory.query("SELECT c1.name as sub_name, c1.slug as sub_slug, c2.name as parent_name, c2.slug as parent_slug FROM categories c1 LEFT JOIN categories c2 ON c1.parent_id = c2.id WHERE c1.id = ?", [product.category_id || '0']),
+            db.inventory.query("SELECT id FROM promoted_products WHERE product_id = ? AND payment_status='paid' AND end_date > NOW() LIMIT 1", [product.id]),
+            db.social ? db.social.query("SELECT COUNT(*) as total FROM product_favorites WHERE product_id = ?", [product.id]) : Promise.resolve([[{total: 0}]])
         ]);
 
-        const parsed = parseProduct(product);
-        const relatedEnriched = await constructProductCards(relRes.rows);
+        let relatedRaw = relRes.rows || [];
+        if (relatedRaw.length === 0) {
+            const fallbackRes = await db.oracle.query(
+                "SELECT id, title, slug, sku, price, discounted_price, image_url, image_urls, video_url, supplier_id FROM products WHERE id != $1 AND status='in_stock' ORDER BY created_at DESC LIMIT 8",
+                [product.id]
+            );
+            relatedRaw = fallbackRes.rows || [];
+        }
 
-        // 4. Final Response Construction
+        const parsed = parseProduct(product);
+        const relatedEnriched = await constructProductCards(relatedRaw);
+
+        const supplierInfo = supRes[0][0] || null;
+        const brandName = supplierInfo ? supplierInfo.brand_name : 'SJ10 Official';
+
+        delete parsed.image_urls; 
+        delete parsed.views;
+
         const response = {
-            ...parsed,
-            views: totalViews, // <--- Correct Total Views
+            id: parsed.id,
+            
+            // 🚨 THE CRITICAL FIX FOR NEXT.JS PAGE.TSX 🚨
+            supplier_id: product.supplier_id, // <--- REQUIRED for getSellerProducts!
+            category_id: product.category_id, // <--- REQUIRED for getRelatedProducts!
+            
+            title: parsed.title,
+            slug: parsed.slug,
+            sku: parsed.sku,
+            description: parsed.description,
+            price: parseFloat(parsed.price || 0),
+            discounted_price: parseFloat(parsed.discounted_price || parsed.price || 0),
+            image_url: parsed.image_url,
+            image_urls: parsed.image_urls_parsed || [parsed.image_url], 
+            package_information: parsed.package_information || "",
+            colors: parsed.colors ? String(parsed.colors).replace(/[\[\]"]/g, '').split(',') : ["Standard"],
+            sizes: parsed.sizes ? String(parsed.sizes).replace(/[\[\]"]/g, '').split(',') : ["Standard"],
+            season: parsed.season || "All Season",
+            views: totalViews,
             stats: {
                 views: totalViews,
                 favorites: parseInt(favCountRes[0][0]?.total || 0)
             },
-            brand_name: supRes[0][0]?.brand_name || 'SJ10 Official',
-            supplier: supRes[0][0] || null,
-            variants: varRes.rows || [],
-            reviews: revRes[0] || [],
-            related_products: relatedEnriched,
+            brand_name: brandName, 
+            supplier: supplierInfo ? {
+                id: supplierInfo.id,
+                name: brandName, 
+                brand_name: brandName,
+                profile_pic: supplierInfo.profile_pic,
+                verified_status: supplierInfo.verified_status,
+                supplier_code: supplierInfo.supplier_code,
+                average_rating: parseFloat(supplierInfo.average_rating || 0),
+                followers_count: parseInt(supplierInfo.followers_count || 0),
+                total_products: parseInt(supplierInfo.total_products || 0),
+                city: supplierInfo.city
+            } : null,
+            variants: varRes.rows || [], 
+            reviews: revRes[0] || [], 
+            
+            related_products: relatedEnriched, 
+            relatedProducts: relatedEnriched,  
+            seller_products: relatedEnriched,  
+            sellerProducts: relatedEnriched,   
+            
             category_info: {
-                name: catRes[0][0]?.sub_name || "Category",
+                name: catRes[0][0]?.sub_name || "Collection",
                 slug: catRes[0][0]?.sub_slug || "all",
                 parent_name: catRes[0][0]?.parent_name || null,
                 parent_slug: catRes[0][0]?.parent_slug || null
@@ -649,11 +710,14 @@ exports.getProductBySlug = async (req, res) => {
             is_promoted: promotedRes[0]?.length > 0
         };
 
-        res.json(response);
+        // 5. 💾 SAVE TO REDIS PERMANENTLY
+        await redis.setEx(productCacheKey, 86400, JSON.stringify(response));
 
-        // 5. ⚡ Increment View in Redis (Atomic)
-        // Detail page khulne par foran Redis mein count barhayen
-      
+        // Background Views Increment
+        await redis.hIncrBy('product_views_buffer', String(product.id), 1);
+
+        res.setHeader('Cache-Control', CACHE_HEADER);
+        res.json(response);
 
     } catch (e) {
         console.error("🔴 Detail Error:", e.message);
