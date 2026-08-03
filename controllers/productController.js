@@ -1692,7 +1692,7 @@ exports.getSearchSitemapIndex = async (req, res) => {
 };
 /* ======================================================
    🖼️ 2. SEARCH SITEMAP PAGE CHUNK (/sitemap-search-:page.xml)
-   Features: Real CDN WebP Product Image Fetching + Fallback Handling
+   With Screen Debugger Comment
    ====================================================== */
 exports.getSearchSitemapChunk = async (req, res) => {
     const rawPage = String(req.params.page || '1').replace(/[^0-9]/g, '');
@@ -1700,31 +1700,33 @@ exports.getSearchSitemapChunk = async (req, res) => {
     const limit = 1000;
     const offset = (page - 1) * limit;
 
-    // Version 7 Cache Key
-    const cacheKey = `google_search_sitemap_chunk_v7_page_${page}`;
+    const cacheKey = `google_search_sitemap_chunk_v12_page_${page}`;
 
     try {
-        // 1. ⚡ Check Redis Cache
         const cachedXml = await redis.get(cacheKey);
         if (cachedXml) {
-            console.log(`⚡ [REDIS] Serving Search Sitemap Chunk Page ${page} from Cache`);
             res.set('Content-Type', 'application/xml');
             return res.send(cachedXml);
         }
 
-        console.log(`🟢 [MySQL + Postgres] Generating Real-Image Search Sitemap Chunk Page ${page}...`);
+        console.log(`🟢 [LIVE DB] Generating Search Sitemap Chunk Page ${page}...`);
 
         const BASE_URL = "https://www.sj10.pk";
         const R2_URL = process.env.CF_PUBLIC_URL || "https://media.sj10.pk";
 
-        // 2. Fetch Keywords
         const [keywords] = await db.inventory.query(
             `SELECT keyword FROM search_keywords WHERE has_results = 1 ORDER BY search_count DESC LIMIT ${limit} OFFSET ${offset}`
-        ).catch(() => [[]]);
+        ).catch((err) => {
+            console.error("🔴 Live MySQL Error:", err.message);
+            return [[]];
+        });
 
+        console.log(`📦 [LIVE SITEMAP] Keywords fetched: ${keywords ? keywords.length : 0}`);
+
+        // 🚨 SCREEN DEBUGGER XML IF 0 ROWS FOUND
         if (!keywords || keywords.length === 0) {
-            const emptyXml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"></urlset>`;
-            return res.status(200).type('application/xml').send(emptyXml);
+            const debugXml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n  <!-- 🛑 DEBUG ALERT: db.inventory returned 0 keywords! Check DB_INVENTORY_URL in .env on P1/P2 and run node seedKeywords.js -->\n</urlset>`;
+            return res.status(200).type('application/xml').send(debugXml);
         }
 
         const escapeXml = (str) => String(str || "").replace(/[<>&'"]/g, (c) => ({'<':'&lt;','>':'&gt;','&':'&amp;','\'':'&apos;','"':'&quot;'}[c] || c));
@@ -1734,7 +1736,6 @@ exports.getSearchSitemapChunk = async (req, res) => {
         xml += `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"\n`;
         xml += `        xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">\n`;
 
-        // 3. Batch Real Image Fetcher
         for (const row of keywords) {
             const cleanKw = row.keyword.trim().toLowerCase();
             const encodedQuery = encodeURIComponent(cleanKw);
@@ -1744,7 +1745,6 @@ exports.getSearchSitemapChunk = async (req, res) => {
             let imageTitle = `${cleanKw} Online Shopping in Pakistan SJ10`;
 
             try {
-                // Search Postgres for matching product
                 const firstWord = cleanKw.split(/\s+/)[0] || cleanKw;
                 const imgRes = await db.oracle.query(
                     "SELECT image_url, image_urls, title FROM products WHERE status = 'in_stock' AND (LOWER(title) ILIKE $1 OR LOWER(title) ILIKE $2) LIMIT 1",
@@ -1763,7 +1763,6 @@ exports.getSearchSitemapChunk = async (req, res) => {
                         } catch(e){}
                     }
 
-                    // 🚨 RESOLVE REAL CDN IMAGE URL 🚨
                     if (rawImg) {
                         if (rawImg.startsWith('http')) imageUrl = rawImg;
                         else if (rawImg.startsWith('/')) imageUrl = `${BASE_URL}${rawImg}`;
@@ -1793,7 +1792,6 @@ exports.getSearchSitemapChunk = async (req, res) => {
         res.send(xml);
 
     } catch (e) {
-        console.error("🔴 Search Sitemap Chunk Error:", e.message);
         res.status(500).send("Error generating sitemap chunk");
     }
 };
