@@ -3,7 +3,12 @@ const router = express.Router();
 const productController = require('../controllers/productController');
 const reviewController = require('../controllers/reviewController');
 const authenticateUser = require('../middleware/authenticateUser');
-
+// ==========================================================
+// 🚨 1. SITEMAP ROUTES (MUST BE AT THE VERY TOP OF FILE!)
+// ==========================================================
+router.get('/sitemap-search.xml', productController.getSearchSitemapIndex);
+router.get('/sitemap-search-:page.xml', productController.getSearchSitemapChunk);
+router.get('/sitemap-search-count', productController.getSearchSitemapCount);
 // --- HOMEPAGE & STATIC DATA ---
 // Add near the top of the file
 router.get('/search', productController.getSearchResults);         // 🚨 YEH LINE MISSING THI!
@@ -19,7 +24,7 @@ router.get('/category-rows', productController.getCategoryRows);
 router.get('/categories-with-subcategories', productController.getCategoriesWithSubcategories);
 router.get('/active-timer', productController.getActivePromotionalTimer);
 router.get('/homepage-categories', productController.getHomepageCategories);
-router.get('/sitemap-search.xml', productController.getSearchSitemap);
+
 // REAL-TIME ROUTES
 // routes/productRoutes.js
 

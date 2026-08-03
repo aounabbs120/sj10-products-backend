@@ -1645,66 +1645,147 @@ setInterval(syncViewsToOracle, 5 * 60 * 1000);
 
 
 /* ======================================================
-   🔥 PROGRAMMATIC SEO (pSEO) SEARCH SITEMAP GENERATOR
-   Generates Google-optimized XML sitemap for popular search queries
-   Cache Timing: 24 Hours (86400s) in Redis
+   🔥 1. SEARCH SITEMAP MASTER INDEX (/sitemap-search.xml)
+   Fixed: 1,000 Keywords Per Chunk Calculation
    ====================================================== */
-exports.getSearchSitemap = async (req, res) => {
-    const cacheKey = "google_search_keywords_sitemap_xml";
+exports.getSearchSitemapIndex = async (req, res) => {
+    const cacheKey = "google_search_sitemap_master_index_xml_v2";
     try {
-        // 1. ⚡ CHECK REDIS CACHE FIRST
         const cachedXml = await redis.get(cacheKey);
         if (cachedXml) {
-            console.log("⚡ [REDIS] Serving Search Sitemap from Super Cache");
             res.set('Content-Type', 'application/xml');
             return res.send(cachedXml);
         }
 
-        console.log("🟢 [MySQL] Cache Miss! Generating Programmatic SEO Search Sitemap...");
-
         const BASE_URL = "https://www.sj10.pk";
 
-        // 2. Query Verified Search Keywords from TiDB MySQL (inventory DB)
-        // Only fetch keywords that yielded results and were searched at least 2 times (Spam/Typos prevention)
+        // Count total keywords in DB
+        const [countRes] = await db.inventory.query(
+            "SELECT COUNT(*) as total FROM search_keywords WHERE has_results = 1"
+        ).catch(() => [[{ total: 0 }]]);
+
+        const total = parseInt(countRes[0]?.total || 0);
+        const perPage = 1000; // 🚨 STRICT 1,000 KEYWORDS PER PAGE
+        const totalPages = Math.max(1, Math.ceil(total / perPage));
+
+        let xml = `<?xml version="1.0" encoding="UTF-8"?>\n`;
+        xml += `<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n`;
+
+        for (let i = 1; i <= totalPages; i++) {
+            xml += `  <sitemap>\n`;
+            xml += `    <loc>${BASE_URL}/sitemap-search-${i}.xml</loc>\n`;
+            xml += `    <lastmod>${new Date().toISOString()}</lastmod>\n`;
+            xml += `  </sitemap>\n`;
+        }
+
+        xml += `</sitemapindex>`;
+
+        await redis.setEx(cacheKey, 86400, xml);
+        res.set('Content-Type', 'application/xml');
+        res.set('Cache-Control', 'public, max-age=3600, s-maxage=86400');
+        res.send(xml);
+
+    } catch (e) {
+        console.error("🔴 Search Sitemap Index Error:", e.message);
+        res.status(500).send("Error generating sitemap index");
+    }
+};
+/* ======================================================
+   🖼️ 2. SEARCH SITEMAP PAGE CHUNK (/sitemap-search-:page.xml)
+   Features: Real CDN WebP Product Image Fetching + Fallback Handling
+   ====================================================== */
+exports.getSearchSitemapChunk = async (req, res) => {
+    const rawPage = String(req.params.page || '1').replace(/[^0-9]/g, '');
+    const page = parseInt(rawPage) || 1;
+    const limit = 1000;
+    const offset = (page - 1) * limit;
+
+    // Version 7 Cache Key
+    const cacheKey = `google_search_sitemap_chunk_v7_page_${page}`;
+
+    try {
+        // 1. ⚡ Check Redis Cache
+        const cachedXml = await redis.get(cacheKey);
+        if (cachedXml) {
+            console.log(`⚡ [REDIS] Serving Search Sitemap Chunk Page ${page} from Cache`);
+            res.set('Content-Type', 'application/xml');
+            return res.send(cachedXml);
+        }
+
+        console.log(`🟢 [MySQL + Postgres] Generating Real-Image Search Sitemap Chunk Page ${page}...`);
+
+        const BASE_URL = "https://www.sj10.pk";
+        const R2_URL = process.env.CF_PUBLIC_URL || "https://media.sj10.pk";
+
+        // 2. Fetch Keywords
         const [keywords] = await db.inventory.query(
-            "SELECT keyword, updated_at FROM search_keywords WHERE has_results = 1 AND search_count >= 2 ORDER BY search_count DESC LIMIT 5000"
+            `SELECT keyword FROM search_keywords WHERE has_results = 1 ORDER BY search_count DESC LIMIT ${limit} OFFSET ${offset}`
         ).catch(() => [[]]);
 
         if (!keywords || keywords.length === 0) {
-            return res.status(200).send('<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n</urlset>');
+            const emptyXml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"></urlset>`;
+            return res.status(200).type('application/xml').send(emptyXml);
         }
 
-        // XML Escaping helper
         const escapeXml = (str) => String(str || "").replace(/[<>&'"]/g, (c) => ({'<':'&lt;','>':'&gt;','&':'&amp;','\'':'&apos;','"':'&quot;'}[c] || c));
+        const nowIso = new Date().toISOString();
 
-        // 3. Build Google-Optimized XML Structure
         let xml = `<?xml version="1.0" encoding="UTF-8"?>\n`;
-        xml += `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n`;
+        xml += `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"\n`;
+        xml += `        xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">\n`;
 
-        keywords.forEach(row => {
-            const encodedQuery = encodeURIComponent(row.keyword);
+        // 3. Batch Real Image Fetcher
+        for (const row of keywords) {
+            const cleanKw = row.keyword.trim().toLowerCase();
+            const encodedQuery = encodeURIComponent(cleanKw);
             const fullUrl = `${BASE_URL}/search?q=${encodedQuery}`;
             
-            // Format date safely
-            let lastMod = new Date().toISOString();
+            let imageUrl = `${BASE_URL}/logo.png`;
+            let imageTitle = `${cleanKw} Online Shopping in Pakistan SJ10`;
+
             try {
-                if (row.updated_at) {
-                    const d = new Date(row.updated_at);
-                    if (!isNaN(d.getTime())) lastMod = d.toISOString();
+                // Search Postgres for matching product
+                const firstWord = cleanKw.split(/\s+/)[0] || cleanKw;
+                const imgRes = await db.oracle.query(
+                    "SELECT image_url, image_urls, title FROM products WHERE status = 'in_stock' AND (LOWER(title) ILIKE $1 OR LOWER(title) ILIKE $2) LIMIT 1",
+                    [`%${cleanKw}%`, `%${firstWord}%`]
+                );
+
+                if (imgRes.rows.length > 0) {
+                    const p = imgRes.rows[0];
+                    if (p.title) imageTitle = p.title;
+
+                    let rawImg = p.image_url;
+                    if (!rawImg && p.image_urls) {
+                        try {
+                            const parsedImgs = typeof p.image_urls === 'string' ? JSON.parse(p.image_urls) : p.image_urls;
+                            if (Array.isArray(parsedImgs) && parsedImgs[0]) rawImg = parsedImgs[0];
+                        } catch(e){}
+                    }
+
+                    // 🚨 RESOLVE REAL CDN IMAGE URL 🚨
+                    if (rawImg) {
+                        if (rawImg.startsWith('http')) imageUrl = rawImg;
+                        else if (rawImg.startsWith('/')) imageUrl = `${BASE_URL}${rawImg}`;
+                        else imageUrl = `${R2_URL}/${rawImg.replace(/^\//, '')}`;
+                    }
                 }
-            } catch(e) {}
+            } catch(e){}
 
             xml += `  <url>\n`;
-            xml += `    <loc>${fullUrl}</loc>\n`;
-            xml += `    <lastmod>${lastMod}</lastmod>\n`;
-            xml += `    <changefreq>daily</changefreq>\n`; // Search landing pages change frequently
-            xml += `    <priority>0.7</priority>\n`;    // High priority for long-tail programmatic SEO
+            xml += `    <loc>${escapeXml(fullUrl)}</loc>\n`;
+            xml += `    <lastmod>${nowIso}</lastmod>\n`;
+            xml += `    <changefreq>daily</changefreq>\n`;
+            xml += `    <priority>0.8</priority>\n`;
+            xml += `    <image:image>\n`;
+            xml += `      <image:loc>${escapeXml(imageUrl)}</image:loc>\n`;
+            xml += `      <image:title>${escapeXml(imageTitle)}</image:title>\n`;
+            xml += `    </image:image>\n`;
             xml += `  </url>\n`;
-        });
+        }
 
         xml += `</urlset>`;
 
-        // 4. 💾 SAVE TO REDIS CACHE FOR 24 HOURS (86400 seconds)
         await redis.setEx(cacheKey, 86400, xml);
 
         res.set('Content-Type', 'application/xml');
@@ -1712,7 +1793,16 @@ exports.getSearchSitemap = async (req, res) => {
         res.send(xml);
 
     } catch (e) {
-        console.error("🔴 Search Sitemap Error:", e.message);
-        res.status(500).send("Error generating search sitemap");
+        console.error("🔴 Search Sitemap Chunk Error:", e.message);
+        res.status(500).send("Error generating sitemap chunk");
+    }
+};
+// Add in controllers/productController.js
+exports.getSearchSitemapCount = async (req, res) => {
+    try {
+        const [countRes] = await db.inventory.query("SELECT COUNT(*) as total FROM search_keywords WHERE has_results = 1");
+        res.json({ total: parseInt(countRes[0]?.total || 0) });
+    } catch(e) {
+        res.json({ total: 254 });
     }
 };
