@@ -6,6 +6,10 @@ const authenticateUser = require('../middleware/authenticateUser');
 
 // --- HOMEPAGE & STATIC DATA ---
 // Add near the top of the file
+router.get('/search', productController.getSearchResults);         // 🚨 YEH LINE MISSING THI!
+router.get('/search-results', productController.getSearchResults); // 🚨 Dono add kar diye
+router.get('/suggestions-text', productController.getSearchSuggestionsText);
+router.get('/suggestions', productController.getSearchSuggestions);
 router.get('/google-shopping-master.xml', productController.getGoogleShoppingMasterFeed);
 router.get('/sitemap-count', productController.getSitemapCount);
 router.get('/shopping-feed', productController.getGoogleShoppingProducts);
@@ -15,6 +19,7 @@ router.get('/category-rows', productController.getCategoryRows);
 router.get('/categories-with-subcategories', productController.getCategoriesWithSubcategories);
 router.get('/active-timer', productController.getActivePromotionalTimer);
 router.get('/homepage-categories', productController.getHomepageCategories);
+router.get('/sitemap-search.xml', productController.getSearchSitemap);
 // REAL-TIME ROUTES
 // routes/productRoutes.js
 
@@ -25,9 +30,7 @@ router.get('/latest-realtime', productController.getLatestProductsRealTime);
 
 // --- EXPLORE & SEARCH ---
 router.get('/explore-feed', productController.getExploreFeed);
-router.get('/search-results', productController.getSearchResults);
-router.get('/suggestions-text', productController.getSearchSuggestionsText);
-router.get('/suggestions', productController.getSearchSuggestions);
+
 router.get('/popular', productController.getPopularProducts);
 router.get('/banners', productController.getBanners);
 router.get('/strip-banners', productController.getActiveStripBanners);

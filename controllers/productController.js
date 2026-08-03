@@ -145,83 +145,239 @@ const constructProductCards = async (rawProducts) => {
         return rawProducts.map(parseProduct);
     }
 };
+// --- HELPER: Save Search Keyword Safely (Only if Products > 0) ---
+const saveSearchKeyword = async (rawKeyword, productCount) => {
+    try {
+        // 🔴 RULE 1: Agar 0 products mili hain, tou database mein save MAT KARO (Spam & Soft 404 protection)
+        if (!rawKeyword || productCount === 0) return; 
+        
+        const cleanKeyword = rawKeyword.trim().toLowerCase().replace(/\s+/g, ' ');
+        
+        // 🔴 RULE 2: Length & Injection Check
+        if (cleanKeyword.length < 3 || cleanKeyword.length > 60) return; 
+        if (/[<>{}]/.test(cleanKeyword)) return; 
+
+        // 🟢 RULE 3: Insert OR Increment Search Count (Duplicates Prevention)
+        const sql = `
+            INSERT INTO search_keywords (keyword, search_count)
+            VALUES (?, 1)
+            ON DUPLICATE KEY UPDATE search_count = search_count + 1;
+        `;
+        await db.inventory.query(sql, [cleanKeyword]);
+        console.log(`📌 [SEO KEYWORD SAVED]: "${cleanKeyword}" (Products Found: ${productCount})`);
+
+    } catch (error) {
+        // Silent catch to prevent blocking user search response
+        console.error("Keyword Save Error:", error.message);
+    }
+};
 /* ======================================================
-   🔥 SMART SEARCH RESULTS (MEILISEARCH + ORACLE POSTGRES FALLBACK)
-   Features: Millisecond Search, Typo-Tolerance, Bulletproof DB Fallback
+   🚀 DARAZ-STYLE DYNAMIC TOKENIZER SEARCH ENGINE (ZERO HARDCODED WORDS)
    ====================================================== */
+
+// 🤖 DARAZ DYNAMIC ALPHANUMERIC TOKENIZER
+const tokenizeSearchQuery = (rawQuery) => {
+    if (!rawQuery) return [];
+    
+    let normalized = rawQuery.toLowerCase()
+        .replace(/(\d+)([a-zA-Z]+)/g, '$1 $2')  // "3pc" -> "3 pc", "10kg" -> "10 kg"
+        .replace(/([a-zA-Z]+)(\d+)/g, '$1 $2')  // "pc3" -> "pc 3"
+        .replace(/[^a-zA-Z0-9]/g, ' ');         // Remove hyphens, punctuation -> spaces
+
+    // Extract clean tokens (words & numbers)
+    let tokens = normalized.split(/\s+/).filter(w => w.length > 0);
+    
+    // Dynamic plural stripper ("suits" -> "suit", "pieces" -> "piece")
+    tokens = tokens.map(t => {
+        if (t.length > 3 && t.endsWith('s') && !t.endsWith('ss')) {
+            return t.slice(0, -1);
+        }
+        return t;
+    });
+
+    return [...new Set(tokens)];
+};
+
 exports.getSearchResults = async (req, res) => {
     try {
         const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 30;
+        const limit = parseInt(req.query.limit) || 40;
         const offset = (page - 1) * limit;
         const { q } = req.query;
 
-        if (!q) return res.json({ products: [], totalCount: 0 });
+        if (!q || q.trim() === '') return res.json({ products: [], totalCount: 0, facets: null });
 
-        console.log(`🔍 [SEARCH] Query received: "${q}"`);
+        const rawCleanQ = q.trim().toLowerCase();
+        
+        // 1. 🚀 DARAZ DYNAMIC TOKENIZATION (No hardcoded words!)
+        const tokens = tokenizeSearchQuery(rawCleanQ);
+        const cacheKey = `search_results_v14_${tokens.join('_')}_p${page}_l${limit}`;
 
-        // Promoted IDs from MySQL (TiDB)
+        // 2. ⚡ CHECK REDIS CACHE FIRST
+        const cachedRes = await redis.get(cacheKey);
+        if (cachedRes) {
+            console.log(`⚡ [REDIS] Serving Dynamic Search Results for "${rawCleanQ}" from Cache`);
+            res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=86400');
+            return res.json(JSON.parse(cachedRes));
+        }
+
+        console.log(`\n============================================`);
+        console.log(`🔍 [DARAZ DYNAMIC SEARCH] Raw: "${rawCleanQ}" ➔ Dynamic Tokens: [${tokens.join(', ')}]`);
+
+        // 3. 🚨 FETCH ALL ACTIVE PROMOTED IDs FROM MYSQL
         const [pRows] = await db.inventory.query(
-            "SELECT product_id FROM promoted_products WHERE payment_status = 'paid' AND start_date <= NOW() AND end_date >= NOW()"
-        );
-        const promotedIds = new Set(pRows.map(r => String(r.product_id)));
+            "SELECT product_id FROM promoted_products WHERE payment_status IN ('paid', 'approved', 'active', 'verification_pending')"
+        ).catch(() => [[]]);
+        
+        const promotedIdsList = (pRows || []).map(r => String(r.product_id).trim().toLowerCase()).filter(Boolean);
+        const promotedSet = new Set(promotedIdsList);
 
-        let productIds = [];
-        let totalCount = 0;
+        // 4. 🔥 DARAZ SPONSORED AD INJECTION (Dynamic Token Match)
+        let injectedPromotedIds = [];
+        if (promotedIdsList.length > 0 && db.oracle) {
+            try {
+                const placeholders = promotedIdsList.map((_, i) => `$${i + 1}`).join(',');
+                
+                // Build dynamic SQL token conditions
+                let promoConditions = tokens.map((_, idx) => `LOWER(REGEXP_REPLACE(title, '[^a-zA-Z0-9]', ' ', 'g')) ILIKE $${promotedIdsList.length + idx + 1}`);
+                let promoParams = tokens.map(t => `%${t}%`);
 
+                const promoSql = `
+                    SELECT id FROM products 
+                    WHERE LOWER(TRIM(id::text)) IN (${placeholders}) 
+                    AND status = 'in_stock' 
+                    AND (${promoConditions.join(' AND ')})
+                `;
+                const promoRes = await db.oracle.query(promoSql, [...promotedIdsList, ...promoParams]);
+                injectedPromotedIds = promoRes.rows.map(r => String(r.id).trim().toLowerCase());
+                
+                if (injectedPromotedIds.length > 0) {
+                    console.log(`🚀 [PROMOTED INJECTION] Dynamic Match Injected ${injectedPromotedIds.length} Promoted Ads for "${rawCleanQ}"!`);
+                }
+            } catch (pErr) { console.error("Promoted Injection Error:", pErr.message); }
+        }
+
+        // 5. Meilisearch Query (Native Tokenizer & Typo Tolerance)
+        let organicIds = [];
         try {
-            // 🚨 STRATEGY A: Query Meilisearch (Typo-Tolerant, Instant)
-            console.log("🏎️ [MEILISEARCH] Querying Meilisearch Engine...");
             const index = meiliClient.index('products');
-            const searchRes = await index.search(q, {
-                limit: limit,
-                offset: offset,
-                attributesToRetrieve: ['id'] // We only need IDs, full data comes from Postgres
-            });
+            const searchRes = await index.search(rawCleanQ, { limit: 60, offset: 0, attributesToRetrieve: ['id'] });
+            organicIds = searchRes.hits.map(hit => String(hit.id).trim().toLowerCase());
+        } catch (e) { console.warn("Meili Offline"); }
 
-            productIds = searchRes.hits.map(hit => hit.id);
-            totalCount = searchRes.estimatedTotalHits;
-            console.log(`✅ [MEILISEARCH] Found ${productIds.length} matches.`);
+        // 6. 🚨 POSTGRES DYNAMIC TOKENIZER FALLBACK
+        if (organicIds.length < 10 && db.oracle) {
+            try {
+                let pgConditions = tokens.map((_, idx) => `(LOWER(REGEXP_REPLACE(title, '[^a-zA-Z0-9]', ' ', 'g')) ILIKE $${idx + 1} OR LOWER(sku) ILIKE $${idx + 1})`);
+                let pgParams = tokens.map(t => `%${t}%`);
 
-        } catch (meiliError) {
-            // 🚨 STRATEGY B: PostgreSQL Fallback (If Meilisearch is offline)
-            console.warn("⚠️ [MEILISEARCH] Offline! Falling back to Postgres ILIKE query...");
-            const searchPattern = `%${q.trim().toLowerCase()}%`;
-            const sql = `
-                SELECT id FROM products 
-                WHERE status = 'in_stock' AND (title ILIKE $1 OR sku ILIKE $1)
-                ORDER BY created_at DESC LIMIT $2 OFFSET $3
-            `;
-            const countSql = "SELECT COUNT(*) FROM products WHERE status = 'in_stock' AND (title ILIKE $1 OR sku ILIKE $1)";
-            
-            const [dbRes, dbCount] = await Promise.all([
-                db.oracle.query(sql, [searchPattern, limit, offset]),
-                db.oracle.query(countSql, [searchPattern])
-            ]);
-
-            productIds = dbRes.rows.map(r => r.id);
-            totalCount = parseInt(dbCount.rows[0].count);
+                const pgSql = `
+                    SELECT id FROM products 
+                    WHERE status = 'in_stock' AND ${pgConditions.join(' AND ')}
+                    ORDER BY created_at DESC LIMIT 60
+                `;
+                const pgRes = await db.oracle.query(pgSql, pgParams);
+                const pgIds = pgRes.rows.map(r => String(r.id).trim().toLowerCase());
+                organicIds = [...new Set([...organicIds, ...pgIds])];
+            } catch(pgErr) { console.error("Postgres Tokenizer Error:", pgErr.message); }
         }
 
-        if (productIds.length === 0) {
-            return res.json({ products: [], totalCount: 0 });
+        const finalProductIds = [...new Set([...injectedPromotedIds, ...organicIds])];
+
+        if (finalProductIds.length === 0) {
+            return res.json({ products: [], totalCount: 0, facets: null });
         }
 
-        // Fetch full product details from Oracle Postgres using IDs
-        const rawProducts = await getProductsFromOracleByIds(productIds);
-        const enrichedProducts = await constructProductCards(rawProducts);
+        // 7. Fetch Product Details
+        const rawProducts = await getProductsFromOracleByIds(finalProductIds);
+        let enrichedProducts = await constructProductCards(rawProducts);
 
-        // Mark Promoted Flag
-        const finalWithFlag = enrichedProducts.map(p => ({
-            ...p,
-            is_promoted: promotedIds.has(String(p.id))
-        }));
+        // 8. Fetch Metrics (Reviews, Favorites, Followers)
+        const pIdsNormalized = enrichedProducts.map(p => String(p.id).trim().toLowerCase());
+        const supplierIdsList = [...new Set(enrichedProducts.map(p => String(p.supplier_id || p.supplier?.id || '').trim().toLowerCase()))].filter(Boolean);
 
-        res.json({ products: finalWithFlag, totalCount });
+        let reviewMap = new Map();
+        let favMap = new Map();
+        let supplierFollowersMap = new Map();
+
+        await Promise.all([
+            db.reviews ? db.reviews.query("SELECT LOWER(TRIM(product_id)) as pid, avg_rating, review_count FROM product_ratings WHERE LOWER(TRIM(product_id)) IN (?)", [pIdsNormalized])
+                .then(([ratings]) => (ratings || []).forEach(r => reviewMap.set(String(r.pid), r)))
+                .catch(() => {}) : Promise.resolve(),
+
+            db.social ? db.social.query("SELECT LOWER(TRIM(product_id)) as pid, COUNT(*) as c FROM product_favorites WHERE LOWER(TRIM(product_id)) IN (?) GROUP BY product_id", [pIdsNormalized])
+                .then(([fCounts]) => (fCounts || []).forEach(f => favMap.set(String(f.pid), f.c)))
+                .catch(() => {}) : Promise.resolve(),
+
+            db.suppliers && supplierIdsList.length > 0 ? db.suppliers.query("SELECT LOWER(TRIM(id)) as sid, followers_count FROM suppliers WHERE LOWER(TRIM(id)) IN (?)", [supplierIdsList])
+                .then(([sups]) => (sups || []).forEach(s => supplierFollowersMap.set(String(s.sid), parseInt(s.followers_count || 0))))
+                .catch(() => {}) : Promise.resolve()
+        ]);
+
+        // Attach Metrics & Calculate Dynamic Facets
+        let minPrice = Infinity;
+        let maxPrice = 0;
+        const categoryCountMap = new Map();
+
+        enrichedProducts.forEach(p => {
+            const pid = String(p.id).trim().toLowerCase();
+            const sid = String(p.supplier_id || p.supplier?.id || '').trim().toLowerCase();
+
+            const rData = reviewMap.get(pid);
+            p.review_count = rData ? parseInt(rData.review_count || 0) : parseInt(p.review_count || 0);
+            p.favorites = favMap.get(pid) || parseInt(p.favorites || 0);
+            p.followers_count = supplierFollowersMap.get(sid) || parseInt(p.supplier?.followers_count || 0);
+            p.views = parseInt(p.views || 0);
+            p.is_promoted = promotedSet.has(pid);
+
+            const itemPrice = p.discounted_price || p.price || 0;
+            if (itemPrice > 0 && itemPrice < minPrice) minPrice = itemPrice;
+            if (itemPrice > maxPrice) maxPrice = itemPrice;
+
+            if (p.category_info?.name) {
+                const cName = p.category_info.name;
+                categoryCountMap.set(cName, (categoryCountMap.get(cName) || 0) + 1);
+            }
+        });
+
+        // 9. 🏆 STRICT 5-TIER RANKING COMPARATOR
+        enrichedProducts.sort((a, b) => {
+            if (b.is_promoted !== a.is_promoted) return (b.is_promoted ? 1 : 0) - (a.is_promoted ? 1 : 0);
+            if ((b.review_count || 0) !== (a.review_count || 0)) return (b.review_count || 0) - (a.review_count || 0);
+            if ((b.favorites || 0) !== (a.favorites || 0)) return (b.favorites || 0) - (a.favorites || 0);
+            if ((b.followers_count || 0) !== (a.followers_count || 0)) return (b.followers_count || 0) - (a.followers_count || 0);
+            return (b.views || 0) - (a.views || 0);
+        });
+
+        const topCategories = Array.from(categoryCountMap.entries())
+            .map(([name, count]) => ({ name, count }))
+            .sort((a, b) => b.count - a.count)
+            .slice(0, 5);
+
+        const paginatedProducts = enrichedProducts.slice(offset, offset + limit);
+
+        const responseData = { 
+            products: paginatedProducts, 
+            totalCount: finalProductIds.length,
+            facets: {
+                minPrice: minPrice === Infinity ? 0 : minPrice,
+                maxPrice: maxPrice,
+                categories: topCategories
+            }
+        };
+
+        // Save Cache & Keyword
+        await redis.setEx(cacheKey, 1800, JSON.stringify(responseData));
+        if (page === 1 && typeof saveSearchKeyword === 'function') {
+            saveSearchKeyword(rawCleanQ, responseData.totalCount);
+        }
+
+        res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=86400');
+        res.json(responseData);
 
     } catch (e) {
-        console.error("🔴 Search API Master Error:", e.message);
-        res.status(500).json({ products: [], totalCount: 0 });
+        console.error("🔴 Daraz Dynamic Search Error:", e.message);
+        res.status(500).json({ products: [], totalCount: 0, facets: null });
     }
 };
 /* ======================================================
@@ -544,30 +700,50 @@ exports.getCategoriesWithSubcategories = async (req, res) => {
 };
 
 /* ======================================================
-   🔥 SEARCH SUGGESTIONS (ORACLE DB)
+   🔥 INSTANT SEARCH SUGGESTIONS (REDIS CACHED + MINIMAL SQL)
    ====================================================== */
 exports.getSearchSuggestions = async (req, res) => {
     try {
         const { q } = req.query;
-        if(!q || q.length < 2) return res.json([]);
+        if (!q || q.length < 2) return res.json([]);
 
-        console.log(`🟢 [ORACLE DB] Fetching Search Suggestions for: ${q}`);
+        const cleanQ = q.trim().toLowerCase();
+        const cacheKey = `search_sug_v2_${cleanQ}`;
 
-        const searchTerm = `%${q.trim()}%`;
-        
-        // Postgres ILIKE is case-insensitive by default
-        // SELECT DISTINCT ensures we don't show the same title twice
-        const result = await db.oracle.query(
-            "SELECT DISTINCT title FROM products WHERE title ILIKE $1 LIMIT 6",
+        // 1. ⚡ CHECK REDIS CACHE FIRST (Sub-5ms response)
+        const cached = await redis.get(cacheKey);
+        if (cached) {
+            return res.json(JSON.parse(cached));
+        }
+
+        console.log(`🟡 [Search Suggestions] Cache Miss for: "${cleanQ}"`);
+        const searchTerm = `%${cleanQ}%`;
+
+        // 2. Query Minimal MySQL Table (search_keywords)
+        const [rows] = await db.inventory.query(
+            "SELECT keyword FROM search_keywords WHERE keyword LIKE ? ORDER BY search_count DESC LIMIT 6",
             [searchTerm]
         );
 
-        const suggestions = result.rows.map(p => p.title);
+        let suggestions = rows.map(r => r.keyword);
+
+        // 3. Fallback to Postgres Product Titles if keyword table is empty
+        if (suggestions.length === 0 && db.oracle) {
+            const prodRes = await db.oracle.query(
+                "SELECT DISTINCT title FROM products WHERE title ILIKE $1 LIMIT 6",
+                [`%${cleanQ}%`]
+            );
+            prodRes.rows.forEach(p => suggestions.push(p.title));
+        }
+
+        // 4. 💾 Save to Redis Cache for 1 Hour (3600 seconds)
+        await redis.setEx(cacheKey, 3600, JSON.stringify(suggestions));
+
         res.json(suggestions);
 
-    } catch(e) {
-        console.error("🔴 Oracle Suggestions Error:", e.message);
-        res.json([]); 
+    } catch (e) {
+        console.error("🔴 Suggestions Error:", e.message);
+        res.json([]);
     }
 };
 // ======================================================
@@ -1466,3 +1642,77 @@ const syncViewsToOracle = async () => {
 // 🕒 Timer: 5 minute = 300,000 milliseconds
 // Isay file ke end par check karein aur update kar dein:
 setInterval(syncViewsToOracle, 5 * 60 * 1000);
+
+
+/* ======================================================
+   🔥 PROGRAMMATIC SEO (pSEO) SEARCH SITEMAP GENERATOR
+   Generates Google-optimized XML sitemap for popular search queries
+   Cache Timing: 24 Hours (86400s) in Redis
+   ====================================================== */
+exports.getSearchSitemap = async (req, res) => {
+    const cacheKey = "google_search_keywords_sitemap_xml";
+    try {
+        // 1. ⚡ CHECK REDIS CACHE FIRST
+        const cachedXml = await redis.get(cacheKey);
+        if (cachedXml) {
+            console.log("⚡ [REDIS] Serving Search Sitemap from Super Cache");
+            res.set('Content-Type', 'application/xml');
+            return res.send(cachedXml);
+        }
+
+        console.log("🟢 [MySQL] Cache Miss! Generating Programmatic SEO Search Sitemap...");
+
+        const BASE_URL = "https://www.sj10.pk";
+
+        // 2. Query Verified Search Keywords from TiDB MySQL (inventory DB)
+        // Only fetch keywords that yielded results and were searched at least 2 times (Spam/Typos prevention)
+        const [keywords] = await db.inventory.query(
+            "SELECT keyword, updated_at FROM search_keywords WHERE has_results = 1 AND search_count >= 2 ORDER BY search_count DESC LIMIT 5000"
+        ).catch(() => [[]]);
+
+        if (!keywords || keywords.length === 0) {
+            return res.status(200).send('<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n</urlset>');
+        }
+
+        // XML Escaping helper
+        const escapeXml = (str) => String(str || "").replace(/[<>&'"]/g, (c) => ({'<':'&lt;','>':'&gt;','&':'&amp;','\'':'&apos;','"':'&quot;'}[c] || c));
+
+        // 3. Build Google-Optimized XML Structure
+        let xml = `<?xml version="1.0" encoding="UTF-8"?>\n`;
+        xml += `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n`;
+
+        keywords.forEach(row => {
+            const encodedQuery = encodeURIComponent(row.keyword);
+            const fullUrl = `${BASE_URL}/search?q=${encodedQuery}`;
+            
+            // Format date safely
+            let lastMod = new Date().toISOString();
+            try {
+                if (row.updated_at) {
+                    const d = new Date(row.updated_at);
+                    if (!isNaN(d.getTime())) lastMod = d.toISOString();
+                }
+            } catch(e) {}
+
+            xml += `  <url>\n`;
+            xml += `    <loc>${fullUrl}</loc>\n`;
+            xml += `    <lastmod>${lastMod}</lastmod>\n`;
+            xml += `    <changefreq>daily</changefreq>\n`; // Search landing pages change frequently
+            xml += `    <priority>0.7</priority>\n`;    // High priority for long-tail programmatic SEO
+            xml += `  </url>\n`;
+        });
+
+        xml += `</urlset>`;
+
+        // 4. 💾 SAVE TO REDIS CACHE FOR 24 HOURS (86400 seconds)
+        await redis.setEx(cacheKey, 86400, xml);
+
+        res.set('Content-Type', 'application/xml');
+        res.set('Cache-Control', 'public, max-age=3600, s-maxage=86400');
+        res.send(xml);
+
+    } catch (e) {
+        console.error("🔴 Search Sitemap Error:", e.message);
+        res.status(500).send("Error generating search sitemap");
+    }
+};

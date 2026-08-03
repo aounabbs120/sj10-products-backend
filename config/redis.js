@@ -1,63 +1,46 @@
-const { createClient } = require('redis');
+// config/redis.js
+const redis = require('redis');
+require('dotenv').config();
 
-// Asli Redis client banayen, lekin usay batayen ke infinite reconnect NA kare
-const realClient = createClient({
-    url: process.env.REDIS_URL,
-    socket: {
-        reconnectStrategy: false // 🔥 Yeh line terminal ke infinite timeout error ko rokegi
-    }
+const client = redis.createClient({
+    url: process.env.REDIS_URL
 });
 
-// Terminal mein anay wale faltu errors ko khamosh kar diya
-realClient.on('error', () => {}); 
+client.on('error', (err) => console.error('🔴 [REDIS] Error:', err.message));
+client.on('connect', () => console.log('⚡ Connected to Centralized Redis Successfully!'));
 
-// 🛡️ Smart Wrapper: Agar Redis down ho toh backend ko safe rakhne ke liye
-const safeClient = {
-    isOpen: false,
-    
-    async connect() {
-        try {
-            await realClient.connect();
-            this.isOpen = true;
-            console.log("⚡ Connected to Centralized Redis Successfully!");
-        } catch (e) {
-            console.log("⚠️ Redis server is currently offline. App running smoothly in Bypass Mode (No Cache).");
-            this.isOpen = false;
-        }
-    },
-
-    async get(key) {
-        if (!this.isOpen) return null;
-        try { return await realClient.get(key); } catch(e) { return null; }
-    },
-
-    async setEx(key, time, value) {
-        if (!this.isOpen) return null;
-        try { return await realClient.setEx(key, time, value); } catch(e) { return null; }
-    },
-
-    async hGetAll(key) {
-        if (!this.isOpen) return {};
-        try { return await realClient.hGetAll(key); } catch(e) { return {}; }
-    },
-
-    async hGet(key, field) {
-        if (!this.isOpen) return null;
-        try { return await realClient.hGet(key, field); } catch(e) { return null; }
-    },
-
-    async hIncrBy(key, field, increment) {
-        if (!this.isOpen) return 1;
-        try { return await realClient.hIncrBy(key, field, increment); } catch(e) { return 1; }
-    },
-
-    async del(key) {
-        if (!this.isOpen) return null;
-        try { return await realClient.del(key); } catch(e) { return null; }
+// Smart Wrapper: Localhost par testing ke waqt Cache Read ko Bypass karein
+const originalGet = client.get.bind(client);
+client.get = async (key) => {
+    if (process.env.DISABLE_REDIS === 'true') {
+        return null; // Forces 100% DB fresh hits on localhost!
     }
+    return await originalGet(key);
 };
 
-// Start-up par connect karne ki koshish karega
-safeClient.connect();
+// 🚨 NEW HACK: Bypass Cache Writing during local testing
+const originalSetEx = client.setEx.bind(client);
+client.setEx = async (key, seconds, value) => {
+    if (process.env.DISABLE_REDIS === 'true') {
+        return 'OK'; // Skip writing to Redis during local testing
+    }
+    return await originalSetEx(key, seconds, value);
+};
 
-module.exports = safeClient;
+// 🚨 NEW HACK: Bypass Hash Writing during local testing
+const originalHSet = client.hSet ? client.hSet.bind(client) : null;
+if (originalHSet) {
+    client.hSet = async (key, field, value) => {
+        if (process.env.DISABLE_REDIS === 'true') {
+            return 1; // Skip writing to Redis
+        }
+        return await originalHSet(key, field, value);
+    };
+}
+
+(async () => {
+    try { await client.connect(); } 
+    catch (e) { console.error('🔴 Redis connection failed:', e.message); }
+})();
+
+module.exports = client;
