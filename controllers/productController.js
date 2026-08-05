@@ -198,30 +198,42 @@ const tokenizeSearchQuery = (rawQuery) => {
     return [...new Set(tokens)];
 };
 
-/* ======================================================
-   🚀 ENTERPRISE SEARCH ENGINE V15 (ID-LEVEL PAGINATION + DETERMINISTIC SEEDED SHUFFLE)
-   Features: Supports 1,000+ matches, fast page loads, and duplicate-free randomized catalog
-   ====================================================== */
+// controllers/productController.js
 
-// 🎲 DETERMINISTIC SEEDED SHUFFLE (Prevents pagination duplicates while mixing matching products)
+// 🎲 DETERMINISTIC SEEDED SHUFFLE (Prevents duplicate items on load more)
 const seededShuffle = (array, seedString) => {
     let seed = 0;
     for (let i = 0; i < seedString.length; i++) {
         seed += seedString.charCodeAt(i);
     }
-    
-    // Seeded LCG Randomizer
     const random = () => {
         const x = Math.sin(seed++) * 10000;
         return x - Math.floor(x);
     };
-
     const shuffled = [...array];
     for (let i = shuffled.length - 1; i > 0; i--) {
         const j = Math.floor(random() * (i + 1));
         [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
     }
     return shuffled;
+};
+
+// 🧼 DYNAMIC KEYWORD MATCH SCORER (With Simple Stemming Support)
+const calculateMatchScore = (title, tokens) => {
+    if (!title) return 0;
+    const cleanTitle = title.toLowerCase().replace(/[^a-zA-Z0-9]/g, ' ');
+    let score = 0;
+    tokens.forEach(token => {
+        let rootToken = token;
+        // Simple plural stripper ("shoes" -> "shoe", "pieces" -> "piece")
+        if (token.length > 3 && token.endsWith('s')) {
+            rootToken = token.slice(0, -1);
+        }
+        if (cleanTitle.includes(rootToken)) {
+            score++;
+        }
+    });
+    return score;
 };
 
 exports.getSearchResults = async (req, res) => {
@@ -234,12 +246,12 @@ exports.getSearchResults = async (req, res) => {
         if (!q || q.trim() === '') return res.json({ products: [], totalCount: 0, facets: null });
 
         const rawCleanQ = q.trim().toLowerCase();
-        
-        // Dynamic Tokenizer compatible caching
         const tokens = rawCleanQ.replace(/[^a-zA-Z0-9]/g, ' ').split(/\s+/).filter(w => w.length > 0);
-        const cacheKey = `search_results_v15_${tokens.join('_')}_p${page}_l${limit}`;
+        
+        // Cache Key
+        const cacheKey = `search_results_v17_${tokens.join('_')}_p${page}_l${limit}`;
 
-        // 1. ⚡ CHECK REDIS CACHE FIRST (0ms Response)
+        // 1. ⚡ CHECK REDIS CACHE FIRST
         const cachedRes = await redis.get(cacheKey);
         if (cachedRes) {
             res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=86400');
@@ -247,17 +259,16 @@ exports.getSearchResults = async (req, res) => {
         }
 
         console.log(`\n============================================`);
-        console.log(`🔍 [DYNAMIC SEARCH] Query: "${rawCleanQ}" | Page: ${page}`);
+        console.log(`🔍 [SEARCH ENGINE V17] Query: "${rawCleanQ}" | Page: ${page}`);
 
         // 2. FETCH ALL ACTIVE PROMOTED IDs FROM MYSQL
         const [pRows] = await db.inventory.query(
             "SELECT product_id FROM promoted_products WHERE payment_status IN ('paid', 'approved', 'active', 'verification_pending')"
         ).catch(() => [[]]);
-        
         const promotedIdsList = (pRows || []).map(r => String(r.product_id).trim().toLowerCase()).filter(Boolean);
         const promotedSet = new Set(promotedIdsList);
 
-        // 3. FETCH MATCHING IDs ONLY (Up to 1000 for high range support)
+        // 3. FETCH MATCHING IDs ONLY (Up to 1000 for full catalog range support)
         let matchedIds = [];
 
         // A. Try Meilisearch First
@@ -269,7 +280,7 @@ exports.getSearchResults = async (req, res) => {
                 attributesToRetrieve: ['id'] 
             });
             matchedIds = searchRes.hits.map(hit => String(hit.id).trim().toLowerCase());
-            console.log(`✅ [MEILISEARCH] Found ${matchedIds.length} matches.`);
+            console.log(`✅ [MEILISEARCH] Found ${matchedIds.length} candidate matches.`);
         } catch (e) { 
             console.warn("Meili Offline, falling back to Postgres"); 
         }
@@ -277,13 +288,14 @@ exports.getSearchResults = async (req, res) => {
         // B. Postgres Fallback
         if (matchedIds.length === 0 && db.oracle && tokens.length > 0) {
             try {
-                let pgConditions = tokens.map((_, idx) => `(LOWER(REGEXP_REPLACE(title, '[^a-zA-Z0-9]', ' ', 'g')) ILIKE $${idx + 1} OR LOWER(sku) ILIKE $${idx + 1})`);
+                let pgConditions = tokens.map((_, idx) => `LOWER(REPLACE(title, '-', ' ')) ILIKE $${idx + 1}`);
                 let pgParams = tokens.map(t => `%${t}%`);
 
+                // Search database for up to 1000 matching IDs
                 const pgSql = `
                     SELECT id FROM products 
-                    WHERE status = 'in_stock' AND ${pgConditions.join(' AND ')}
-                    ORDER BY created_at DESC LIMIT 1000
+                    WHERE status = 'in_stock' AND (${pgConditions.map((cond, idx) => `(${cond} OR LOWER(sku) ILIKE $${idx + 1})`).join(' OR ')})
+                    LIMIT 1000
                 `;
                 const pgRes = await db.oracle.query(pgSql, pgParams);
                 matchedIds = pgRes.rows.map(r => String(r.id).trim().toLowerCase());
@@ -297,49 +309,15 @@ exports.getSearchResults = async (req, res) => {
             return res.json({ products: [], totalCount: 0, facets: null });
         }
 
-        // 4. SEPARATE PROMOTED AND ORGANIC MATCHES
-        const promotedMatches = [];
-        const organicMatches = [];
+        // 4. FETCH SMALL ATTRIBUTES (Id, Title, Views, Supplier) FOR MATCHED IDs TO RANK THEM
+        const [lightweightProducts] = await Promise.all([
+            getProductsFromOracleByIds(matchedIds) // Returns lightweight array of matching products
+        ]);
 
-        matchedIds.forEach(id => {
-            if (promotedSet.has(id)) {
-                promotedMatches.push(id);
-            } else {
-                organicMatches.push(id);
-            }
-        });
+        const pIdsNormalized = lightweightProducts.map(p => String(p.id).trim().toLowerCase());
+        const supplierIdsList = [...new Set(lightweightProducts.map(p => String(p.supplier_id || p.supplier?.id || '').trim().toLowerCase()))].filter(Boolean);
 
-        // 5. DETERMINISTIC SHUFFLE ORGANIC MATCHES
-        const todayString = new Date().toISOString().slice(0, 10); // Matches date: "2026-08-04"
-        const seedString = `${rawCleanQ}_${todayString}`;
-        const randomizedOrganicMatches = seededShuffle(organicMatches, seedString);
-
-        // Merge: Promoted ads always at the top, then mixed organic items
-        const finalSortedIds = [...promotedMatches, ...randomizedOrganicMatches];
-
-        // 6. PAGINATE THE MATCHING IDs array (ID-Level Pagination)
-        const paginatedIds = finalSortedIds.slice(offset, offset + limit);
-
-        if (paginatedIds.length === 0) {
-            return res.json({ products: [], totalCount: finalSortedIds.length, facets: null });
-        }
-
-        // 7. FETCH FULL DETAILS ONLY FOR THE PAGINATED CHUNK (40 items)
-        const rawProducts = await getProductsFromOracleByIds(paginatedIds);
-        let enrichedProducts = await constructProductCards(rawProducts);
-
-        // Align details array to the sorted ID sequence
-        const idOrderMap = new Map(paginatedIds.map((id, index) => [id, index]));
-        enrichedProducts.sort((a, b) => {
-            const orderA = idOrderMap.get(String(a.id).trim().toLowerCase());
-            const orderB = idOrderMap.get(String(b.id).trim().toLowerCase());
-            return (orderA ?? 0) - (orderB ?? 0);
-        });
-
-        // 8. FETCH METRICS (Reviews, Favorites, Followers) FOR CHUNK ONLY
-        const pIdsNormalized = enrichedProducts.map(p => String(p.id).trim().toLowerCase());
-        const supplierIdsList = [...new Set(enrichedProducts.map(p => String(p.supplier_id || p.supplier?.id || '').trim().toLowerCase()))].filter(Boolean);
-
+        // 5. FETCH METRICS FOR THESE MATCHED IDs IN BATCH (Extremely Fast)
         let reviewMap = new Map();
         let favMap = new Map();
         let supplierFollowersMap = new Map();
@@ -358,21 +336,105 @@ exports.getSearchResults = async (req, res) => {
                 .catch(() => {}) : Promise.resolve()
         ]);
 
-        // Attach Metrics & Calculate Dynamic Facets
+        // 6. ATTACH METRICS & CALCULATE WORD MATCH SCORE
+        const todayString = new Date().toISOString().slice(0, 10);
+        const seedString = `${rawCleanQ}_${todayString}`;
+
+        const candidates = lightweightProducts.map(p => {
+            const pid = String(p.id).trim().toLowerCase();
+            const sid = String(p.supplier_id || p.supplier?.id || '').trim().toLowerCase();
+            const rData = reviewMap.get(pid);
+
+            return {
+                id: p.id,
+                title: p.title || '',
+                is_promoted: promotedSet.has(pid),
+                match_score: calculateMatchScore(p.title, tokens), // Word match count
+                review_count: rData ? parseInt(rData.review_count || 0) : parseInt(p.review_count || 0),
+                favorites: favMap.get(pid) || parseInt(p.favorites || 0),
+                followers_count: supplierFollowersMap.get(sid) || parseInt(p.supplier?.followers_count || 0),
+                views: parseInt(p.views || 0)
+            };
+        });
+
+        // 7. MULTI-TIER RELEVANCE RANKING ENGINE
+        candidates.sort((a, b) => {
+            // Tier 1: Promoted products matching search terms always come first
+            if (b.is_promoted !== a.is_promoted) return (b.is_promoted ? 1 : 0) - (a.is_promoted ? 1 : 0);
+            
+            // Tier 2: Match Score (Highest matched words first)
+            if (b.match_score !== a.match_score) return b.match_score - a.match_score;
+            
+            // Tier 3: Most Reviewed (Highest Sales & Trust)
+            if (b.review_count !== a.review_count) return b.review_count - a.review_count;
+            
+            // Tier 4: Most Favorited
+            if (b.favorites !== a.favorites) return b.favorites - a.favorites;
+            
+            // Tier 5: Supplier followers count
+            if (b.followers_count !== a.followers_count) return b.followers_count - a.followers_count;
+            
+            // Tier 6: Views
+            return b.views - a.views;
+        });
+
+        // Group by match score to apply randomized shuffle within same relevance scores
+        // This ensures catalog freshness without breaking the strict matching relevance
+        const groupedByScore = {};
+        candidates.forEach(c => {
+            const key = `${c.is_promoted ? 'promo' : 'org'}_score_${c.match_score}`;
+            if (!groupedByScore[key]) groupedByScore[key] = [];
+            groupedByScore[key].push(c);
+        });
+
+        let finalSortedCandidates = [];
+        Object.keys(groupedByScore).sort((a, b) => {
+            // Sort groups: promoted first, then highest scores
+            if (a.startsWith('promo') && !b.startsWith('promo')) return -1;
+            if (!a.startsWith('promo') && b.startsWith('promo')) return 1;
+            const scoreA = parseInt(a.replace(/[^0-9]/g, '')) || 0;
+            const scoreB = parseInt(b.replace(/[^0-9]/g, '')) || 0;
+            return scoreB - scoreA;
+        }).forEach(key => {
+            // Seeded shuffle within each group to keep it stable but fresh
+            const shuffledGroup = seededShuffle(groupedByScore[key], `${seedString}_${key}`);
+            finalSortedCandidates = [...finalSortedCandidates, ...shuffledGroup];
+        });
+
+        // 8. ID-LEVEL PAGINATION ON THE RANKED CANDIDATES
+        const paginatedCandidates = finalSortedCandidates.slice(offset, offset + limit);
+        const paginatedIds = paginatedCandidates.map(c => String(c.id).trim().toLowerCase());
+
+        if (paginatedIds.length === 0) {
+            return res.json({ products: [], totalCount: finalSortedIds.length, facets: null });
+        }
+
+        // 9. FETCH FULL DETAILS ONLY FOR THE PAGINATED CHUNK (40 items)
+        const rawProducts = await getProductsFromOracleByIds(paginatedIds);
+        let enrichedProducts = await constructProductCards(rawProducts);
+
+        // Maintain exact order of sorted candidates
+        const idOrderMap = new Map(paginatedIds.map((id, index) => [id, index]));
+        enrichedProducts.sort((a, b) => {
+            const orderA = idOrderMap.get(String(a.id).trim().toLowerCase());
+            const orderB = idOrderMap.get(String(b.id).trim().toLowerCase());
+            return (orderA ?? 0) - (orderB ?? 0);
+        });
+
+        // Calculate dynamic facets and attach final parameters
         let minPrice = Infinity;
         let maxPrice = 0;
         const categoryCountMap = new Map();
 
         enrichedProducts.forEach(p => {
-            const pid = String(p.id).trim().toLowerCase();
-            const sid = String(p.supplier_id || p.supplier?.id || '').trim().toLowerCase();
-
-            const rData = reviewMap.get(pid);
-            p.review_count = rData ? parseInt(rData.review_count || 0) : parseInt(p.review_count || 0);
-            p.favorites = favMap.get(pid) || parseInt(p.favorites || 0);
-            p.followers_count = supplierFollowersMap.get(sid) || parseInt(p.supplier?.followers_count || 0);
-            p.views = parseInt(p.views || 0);
-            p.is_promoted = promotedSet.has(pid);
+            const pId = String(p.id).trim().toLowerCase();
+            const candidateInfo = paginatedCandidates.find(c => String(c.id).trim().toLowerCase() === pId);
+            
+            if (candidateInfo) {
+                p.review_count = candidateInfo.review_count;
+                p.favorites = candidateInfo.favorites;
+                p.is_promoted = candidateInfo.is_promoted;
+            }
 
             const itemPrice = p.discounted_price || p.price || 0;
             if (itemPrice > 0 && itemPrice < minPrice) minPrice = itemPrice;
@@ -391,7 +453,7 @@ exports.getSearchResults = async (req, res) => {
 
         const responseData = { 
             products: enrichedProducts, 
-            totalCount: finalSortedIds.length,
+            totalCount: finalSortedCandidates.length,
             facets: {
                 minPrice: minPrice === Infinity ? 0 : minPrice,
                 maxPrice: maxPrice,
@@ -399,13 +461,13 @@ exports.getSearchResults = async (req, res) => {
             }
         };
 
-        // Save Cache
+        // Cache response
         await redis.setEx(cacheKey, 1800, JSON.stringify(responseData));
         if (page === 1 && typeof saveSearchKeyword === 'function') {
             saveSearchKeyword(rawCleanQ, responseData.totalCount);
         }
 
-        console.log(`🎯 [SEARCH COMPLETED] Total matches: ${finalSortedIds.length} | Displaying Page ${page} (${enrichedProducts.length} items)`);
+        console.log(`🎯 [SEARCH COMPLETED] Matches: ${finalSortedCandidates.length} | Displaying Page ${page} (${enrichedProducts.length} items)`);
         console.log(`============================================\n`);
 
         res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=86400');
