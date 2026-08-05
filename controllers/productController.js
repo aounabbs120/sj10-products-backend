@@ -198,6 +198,32 @@ const tokenizeSearchQuery = (rawQuery) => {
     return [...new Set(tokens)];
 };
 
+/* ======================================================
+   🚀 ENTERPRISE SEARCH ENGINE V15 (ID-LEVEL PAGINATION + DETERMINISTIC SEEDED SHUFFLE)
+   Features: Supports 1,000+ matches, fast page loads, and duplicate-free randomized catalog
+   ====================================================== */
+
+// 🎲 DETERMINISTIC SEEDED SHUFFLE (Prevents pagination duplicates while mixing matching products)
+const seededShuffle = (array, seedString) => {
+    let seed = 0;
+    for (let i = 0; i < seedString.length; i++) {
+        seed += seedString.charCodeAt(i);
+    }
+    
+    // Seeded LCG Randomizer
+    const random = () => {
+        const x = Math.sin(seed++) * 10000;
+        return x - Math.floor(x);
+    };
+
+    const shuffled = [...array];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    return shuffled;
+};
+
 exports.getSearchResults = async (req, res) => {
     try {
         const page = parseInt(req.query.page) || 1;
@@ -209,22 +235,21 @@ exports.getSearchResults = async (req, res) => {
 
         const rawCleanQ = q.trim().toLowerCase();
         
-        // 1. 🚀 DARAZ DYNAMIC TOKENIZATION (No hardcoded words!)
-        const tokens = tokenizeSearchQuery(rawCleanQ);
-        const cacheKey = `search_results_v14_${tokens.join('_')}_p${page}_l${limit}`;
+        // Dynamic Tokenizer compatible caching
+        const tokens = rawCleanQ.replace(/[^a-zA-Z0-9]/g, ' ').split(/\s+/).filter(w => w.length > 0);
+        const cacheKey = `search_results_v15_${tokens.join('_')}_p${page}_l${limit}`;
 
-        // 2. ⚡ CHECK REDIS CACHE FIRST
+        // 1. ⚡ CHECK REDIS CACHE FIRST (0ms Response)
         const cachedRes = await redis.get(cacheKey);
         if (cachedRes) {
-            console.log(`⚡ [REDIS] Serving Dynamic Search Results for "${rawCleanQ}" from Cache`);
             res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=86400');
             return res.json(JSON.parse(cachedRes));
         }
 
         console.log(`\n============================================`);
-        console.log(`🔍 [DARAZ DYNAMIC SEARCH] Raw: "${rawCleanQ}" ➔ Dynamic Tokens: [${tokens.join(', ')}]`);
+        console.log(`🔍 [DYNAMIC SEARCH] Query: "${rawCleanQ}" | Page: ${page}`);
 
-        // 3. 🚨 FETCH ALL ACTIVE PROMOTED IDs FROM MYSQL
+        // 2. FETCH ALL ACTIVE PROMOTED IDs FROM MYSQL
         const [pRows] = await db.inventory.query(
             "SELECT product_id FROM promoted_products WHERE payment_status IN ('paid', 'approved', 'active', 'verification_pending')"
         ).catch(() => [[]]);
@@ -232,41 +257,25 @@ exports.getSearchResults = async (req, res) => {
         const promotedIdsList = (pRows || []).map(r => String(r.product_id).trim().toLowerCase()).filter(Boolean);
         const promotedSet = new Set(promotedIdsList);
 
-        // 4. 🔥 DARAZ SPONSORED AD INJECTION (Dynamic Token Match)
-        let injectedPromotedIds = [];
-        if (promotedIdsList.length > 0 && db.oracle) {
-            try {
-                const placeholders = promotedIdsList.map((_, i) => `$${i + 1}`).join(',');
-                
-                // Build dynamic SQL token conditions
-                let promoConditions = tokens.map((_, idx) => `LOWER(REGEXP_REPLACE(title, '[^a-zA-Z0-9]', ' ', 'g')) ILIKE $${promotedIdsList.length + idx + 1}`);
-                let promoParams = tokens.map(t => `%${t}%`);
+        // 3. FETCH MATCHING IDs ONLY (Up to 1000 for high range support)
+        let matchedIds = [];
 
-                const promoSql = `
-                    SELECT id FROM products 
-                    WHERE LOWER(TRIM(id::text)) IN (${placeholders}) 
-                    AND status = 'in_stock' 
-                    AND (${promoConditions.join(' AND ')})
-                `;
-                const promoRes = await db.oracle.query(promoSql, [...promotedIdsList, ...promoParams]);
-                injectedPromotedIds = promoRes.rows.map(r => String(r.id).trim().toLowerCase());
-                
-                if (injectedPromotedIds.length > 0) {
-                    console.log(`🚀 [PROMOTED INJECTION] Dynamic Match Injected ${injectedPromotedIds.length} Promoted Ads for "${rawCleanQ}"!`);
-                }
-            } catch (pErr) { console.error("Promoted Injection Error:", pErr.message); }
-        }
-
-        // 5. Meilisearch Query (Native Tokenizer & Typo Tolerance)
-        let organicIds = [];
+        // A. Try Meilisearch First
         try {
             const index = meiliClient.index('products');
-            const searchRes = await index.search(rawCleanQ, { limit: 60, offset: 0, attributesToRetrieve: ['id'] });
-            organicIds = searchRes.hits.map(hit => String(hit.id).trim().toLowerCase());
-        } catch (e) { console.warn("Meili Offline"); }
+            const searchRes = await index.search(rawCleanQ, { 
+                limit: 1000, 
+                offset: 0, 
+                attributesToRetrieve: ['id'] 
+            });
+            matchedIds = searchRes.hits.map(hit => String(hit.id).trim().toLowerCase());
+            console.log(`✅ [MEILISEARCH] Found ${matchedIds.length} matches.`);
+        } catch (e) { 
+            console.warn("Meili Offline, falling back to Postgres"); 
+        }
 
-        // 6. 🚨 POSTGRES DYNAMIC TOKENIZER FALLBACK
-        if (organicIds.length < 10 && db.oracle) {
+        // B. Postgres Fallback
+        if (matchedIds.length === 0 && db.oracle && tokens.length > 0) {
             try {
                 let pgConditions = tokens.map((_, idx) => `(LOWER(REGEXP_REPLACE(title, '[^a-zA-Z0-9]', ' ', 'g')) ILIKE $${idx + 1} OR LOWER(sku) ILIKE $${idx + 1})`);
                 let pgParams = tokens.map(t => `%${t}%`);
@@ -274,25 +283,60 @@ exports.getSearchResults = async (req, res) => {
                 const pgSql = `
                     SELECT id FROM products 
                     WHERE status = 'in_stock' AND ${pgConditions.join(' AND ')}
-                    ORDER BY created_at DESC LIMIT 60
+                    ORDER BY created_at DESC LIMIT 1000
                 `;
                 const pgRes = await db.oracle.query(pgSql, pgParams);
-                const pgIds = pgRes.rows.map(r => String(r.id).trim().toLowerCase());
-                organicIds = [...new Set([...organicIds, ...pgIds])];
-            } catch(pgErr) { console.error("Postgres Tokenizer Error:", pgErr.message); }
+                matchedIds = pgRes.rows.map(r => String(r.id).trim().toLowerCase());
+                console.log(`🟢 [POSTGRES FALLBACK] Found ${matchedIds.length} matches.`);
+            } catch(pgErr) { 
+                console.error("Postgres Tokenizer Error:", pgErr.message); 
+            }
         }
 
-        const finalProductIds = [...new Set([...injectedPromotedIds, ...organicIds])];
-
-        if (finalProductIds.length === 0) {
+        if (matchedIds.length === 0) {
             return res.json({ products: [], totalCount: 0, facets: null });
         }
 
-        // 7. Fetch Product Details
-        const rawProducts = await getProductsFromOracleByIds(finalProductIds);
+        // 4. SEPARATE PROMOTED AND ORGANIC MATCHES
+        const promotedMatches = [];
+        const organicMatches = [];
+
+        matchedIds.forEach(id => {
+            if (promotedSet.has(id)) {
+                promotedMatches.push(id);
+            } else {
+                organicMatches.push(id);
+            }
+        });
+
+        // 5. DETERMINISTIC SHUFFLE ORGANIC MATCHES
+        const todayString = new Date().toISOString().slice(0, 10); // Matches date: "2026-08-04"
+        const seedString = `${rawCleanQ}_${todayString}`;
+        const randomizedOrganicMatches = seededShuffle(organicMatches, seedString);
+
+        // Merge: Promoted ads always at the top, then mixed organic items
+        const finalSortedIds = [...promotedMatches, ...randomizedOrganicMatches];
+
+        // 6. PAGINATE THE MATCHING IDs array (ID-Level Pagination)
+        const paginatedIds = finalSortedIds.slice(offset, offset + limit);
+
+        if (paginatedIds.length === 0) {
+            return res.json({ products: [], totalCount: finalSortedIds.length, facets: null });
+        }
+
+        // 7. FETCH FULL DETAILS ONLY FOR THE PAGINATED CHUNK (40 items)
+        const rawProducts = await getProductsFromOracleByIds(paginatedIds);
         let enrichedProducts = await constructProductCards(rawProducts);
 
-        // 8. Fetch Metrics (Reviews, Favorites, Followers)
+        // Align details array to the sorted ID sequence
+        const idOrderMap = new Map(paginatedIds.map((id, index) => [id, index]));
+        enrichedProducts.sort((a, b) => {
+            const orderA = idOrderMap.get(String(a.id).trim().toLowerCase());
+            const orderB = idOrderMap.get(String(b.id).trim().toLowerCase());
+            return (orderA ?? 0) - (orderB ?? 0);
+        });
+
+        // 8. FETCH METRICS (Reviews, Favorites, Followers) FOR CHUNK ONLY
         const pIdsNormalized = enrichedProducts.map(p => String(p.id).trim().toLowerCase());
         const supplierIdsList = [...new Set(enrichedProducts.map(p => String(p.supplier_id || p.supplier?.id || '').trim().toLowerCase()))].filter(Boolean);
 
@@ -340,25 +384,14 @@ exports.getSearchResults = async (req, res) => {
             }
         });
 
-        // 9. 🏆 STRICT 5-TIER RANKING COMPARATOR
-        enrichedProducts.sort((a, b) => {
-            if (b.is_promoted !== a.is_promoted) return (b.is_promoted ? 1 : 0) - (a.is_promoted ? 1 : 0);
-            if ((b.review_count || 0) !== (a.review_count || 0)) return (b.review_count || 0) - (a.review_count || 0);
-            if ((b.favorites || 0) !== (a.favorites || 0)) return (b.favorites || 0) - (a.favorites || 0);
-            if ((b.followers_count || 0) !== (a.followers_count || 0)) return (b.followers_count || 0) - (a.followers_count || 0);
-            return (b.views || 0) - (a.views || 0);
-        });
-
         const topCategories = Array.from(categoryCountMap.entries())
             .map(([name, count]) => ({ name, count }))
             .sort((a, b) => b.count - a.count)
             .slice(0, 5);
 
-        const paginatedProducts = enrichedProducts.slice(offset, offset + limit);
-
         const responseData = { 
-            products: paginatedProducts, 
-            totalCount: finalProductIds.length,
+            products: enrichedProducts, 
+            totalCount: finalSortedIds.length,
             facets: {
                 minPrice: minPrice === Infinity ? 0 : minPrice,
                 maxPrice: maxPrice,
@@ -366,17 +399,20 @@ exports.getSearchResults = async (req, res) => {
             }
         };
 
-        // Save Cache & Keyword
+        // Save Cache
         await redis.setEx(cacheKey, 1800, JSON.stringify(responseData));
         if (page === 1 && typeof saveSearchKeyword === 'function') {
             saveSearchKeyword(rawCleanQ, responseData.totalCount);
         }
 
+        console.log(`🎯 [SEARCH COMPLETED] Total matches: ${finalSortedIds.length} | Displaying Page ${page} (${enrichedProducts.length} items)`);
+        console.log(`============================================\n`);
+
         res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=86400');
         res.json(responseData);
 
     } catch (e) {
-        console.error("🔴 Daraz Dynamic Search Error:", e.message);
+        console.error("🔴 Search Error:", e.message);
         res.status(500).json({ products: [], totalCount: 0, facets: null });
     }
 };
