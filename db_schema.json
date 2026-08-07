@@ -1,0 +1,288 @@
+{
+  "products": [
+    {
+      "column": "id",
+      "dataType": "character varying",
+      "nullable": false,
+      "default": null
+    },
+    {
+      "column": "supplier_id",
+      "dataType": "character varying",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "category_id",
+      "dataType": "character varying",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "title",
+      "dataType": "text",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "description",
+      "dataType": "text",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "price",
+      "dataType": "numeric",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "discounted_price",
+      "dataType": "numeric",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "quantity",
+      "dataType": "integer",
+      "nullable": true,
+      "default": "0"
+    },
+    {
+      "column": "status",
+      "dataType": "character varying",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "brand",
+      "dataType": "character varying",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "sizes",
+      "dataType": "text",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "colors",
+      "dataType": "text",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "size_data",
+      "dataType": "text",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "material_type",
+      "dataType": "character varying",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "age_group",
+      "dataType": "character varying",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "imported_region",
+      "dataType": "character varying",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "warranty_type",
+      "dataType": "character varying",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "warranty_details",
+      "dataType": "text",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "image_url",
+      "dataType": "text",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "image_urls",
+      "dataType": "text",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "video_url",
+      "dataType": "text",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "fabric",
+      "dataType": "character varying",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "season",
+      "dataType": "character varying",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "attributes",
+      "dataType": "text",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "package_information",
+      "dataType": "text",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "shipping_details",
+      "dataType": "text",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "views",
+      "dataType": "integer",
+      "nullable": true,
+      "default": "0"
+    },
+    {
+      "column": "sku",
+      "dataType": "character varying",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "slug",
+      "dataType": "text",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "is_deleted",
+      "dataType": "integer",
+      "nullable": true,
+      "default": "0"
+    },
+    {
+      "column": "created_at",
+      "dataType": "character varying",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "price_checked",
+      "dataType": "integer",
+      "nullable": true,
+      "default": "0"
+    },
+    {
+      "column": "cj_pid",
+      "dataType": "character varying",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "last_synced_at",
+      "dataType": "character varying",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "markaz_code",
+      "dataType": "character varying",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "shard_key",
+      "dataType": "character varying",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "markaz_url",
+      "dataType": "character varying",
+      "nullable": true,
+      "default": null
+    }
+  ],
+  "variants": [
+    {
+      "column": "id",
+      "dataType": "character varying",
+      "nullable": false,
+      "default": null
+    },
+    {
+      "column": "product_id",
+      "dataType": "character varying",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "custom_color",
+      "dataType": "character varying",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "custom_size",
+      "dataType": "character varying",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "price",
+      "dataType": "numeric",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "stock",
+      "dataType": "integer",
+      "nullable": true,
+      "default": "0"
+    },
+    {
+      "column": "sku",
+      "dataType": "character varying",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "column": "is_custom",
+      "dataType": "integer",
+      "nullable": true,
+      "default": "1"
+    },
+    {
+      "column": "created_at",
+      "dataType": "timestamp without time zone",
+      "nullable": true,
+      "default": "CURRENT_TIMESTAMP"
+    },
+    {
+      "column": "image_url",
+      "dataType": "text",
+      "nullable": true,
+      "default": null
+    }
+  ]
+}

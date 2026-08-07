@@ -1,24 +1,30 @@
+// user_backend/routes/productRoutes.js
 const express = require('express');
 const router = express.Router();
 const productController = require('../controllers/productController');
 const reviewController = require('../controllers/reviewController');
 const authenticateUser = require('../middleware/authenticateUser');
+
 // ==========================================================
 // 🚨 1. SITEMAP ROUTES (MUST BE AT THE VERY TOP OF FILE!)
 // ==========================================================
 router.get('/sitemap-search.xml', productController.getSearchSitemapIndex);
 router.get('/sitemap-search-:page.xml', productController.getSearchSitemapChunk);
 router.get('/sitemap-search-count', productController.getSearchSitemapCount);
+
 // --- HOMEPAGE & STATIC DATA ---
-// Add near the top of the file
-router.get('/search', productController.getSearchResults);         // 🚨 YEH LINE MISSING THI!
-router.get('/search-results', productController.getSearchResults); // 🚨 Dono add kar diye
+router.get('/search', productController.getSearchResults);
+router.get('/search-results', productController.getSearchResults);
 router.get('/suggestions-text', productController.getSearchSuggestionsText);
 router.get('/suggestions', productController.getSearchSuggestions);
 router.get('/google-shopping-master.xml', productController.getGoogleShoppingMasterFeed);
 router.get('/sitemap-count', productController.getSitemapCount);
 router.get('/shopping-feed', productController.getGoogleShoppingProducts);
+
+// 🟢 HOMEPAGE ROUTES (Dono Support Kardiye Hain)
 router.get('/homepage-data', productController.getHomepageData);
+router.get('/homepage-master', productController.getHomepageData); // Alias Added!
+
 router.get('/sitemap-urls', productController.getSitemapUrls);
 router.get('/category-rows', productController.getCategoryRows);
 router.get('/categories-with-subcategories', productController.getCategoriesWithSubcategories);
@@ -26,30 +32,27 @@ router.get('/active-timer', productController.getActivePromotionalTimer);
 router.get('/homepage-categories', productController.getHomepageCategories);
 
 // REAL-TIME ROUTES
-// routes/productRoutes.js
-
-// New lightweight route for Product Cards (Daraz Style)
-// It handles shard-specific or global requests with strict pagination
 router.get('/feed-cards', productController.getProductCards);
 router.get('/latest-realtime', productController.getLatestProductsRealTime);
 
 // --- EXPLORE & SEARCH ---
 router.get('/explore-feed', productController.getExploreFeed);
-
 router.get('/popular', productController.getPopularProducts);
 router.get('/banners', productController.getBanners);
 router.get('/strip-banners', productController.getActiveStripBanners);
+
 // --- CATEGORY ---
 router.get('/category/:slug', productController.getProductsByCategorySlug);
 router.get('/:id/stats', productController.getProductStats);
-// --- SINGLE PRODUCT ROUTES (THE FIX) ---
+
+// --- SINGLE PRODUCT ROUTES (FIXED :slug PARAMETER) ---
 
 // 1. Matches: /api/products/slug/bike-cover--12
 router.get('/slug/:slug', productController.getProductBySlug);
 
-// 2. Matches: /api/products/bike-cover--12  (Fallback if frontend omits /slug/)
-// 🔥 CHANGE: Point this to getProductBySlug too! It is smart enough to handle IDs or Slugs.
-router.get('/:id', productController.getProductBySlug); 
+// 2. Matches: /api/products/bike-cover--12
+// 🟢 FIX: Changed :id to :slug so req.params.slug is defined!
+router.get('/:slug', productController.getProductBySlug); 
 
 // --- ACTIONS ---
 router.post('/:id/view', productController.incrementProductView);
