@@ -899,6 +899,8 @@ exports.getProductBySlug = async (req, res) => {
 
         // controllers/productController.js (Inside getProductBySlug function)
 
+// controllers/productController.js (Inside getProductBySlug function)
+
 const [varRes, supRes, revRes, relRes, catRes, promotedRes, favCountRes, discountRes] = await Promise.all([
     db.oracle.query("SELECT id, custom_color as color, custom_size as size, price, stock, image_url as image FROM variants WHERE product_id = $1", [product.id]), 
     db.suppliers.query("SELECT id, brand_name, profile_pic, verified_status, supplier_code, average_rating, followers_count, total_products, city FROM suppliers WHERE LOWER(TRIM(id)) = LOWER(TRIM(?)) LIMIT 1", [String(product.supplier_id || '').trim()]),
@@ -908,8 +910,8 @@ const [varRes, supRes, revRes, relRes, catRes, promotedRes, favCountRes, discoun
     db.inventory.query("SELECT id FROM promoted_products WHERE product_id = ? AND payment_status='paid' AND end_date > NOW() LIMIT 1", [product.id]),
     db.social ? db.social.query("SELECT COUNT(*) as total FROM product_favorites WHERE product_id = ?", [product.id]) : Promise.resolve([[{total: 0}]]),
     
-   // 🟢 FETCH DISCOUNT NAME & END TIME FROM INVENTORY DB
-    db.inventory.query("SELECT d.name, d.end_time, d.end_date FROM discount_products dp JOIN discounts d ON dp.discount_id = d.id WHERE d.is_active = 1 AND dp.product_id = ? LIMIT 1", [product.id]).catch(() => [[ ]])
+    // 🟢 FIX: Select ALL columns (d.*) from discounts table to catch 'expiration' column
+    db.inventory.query("SELECT d.* FROM discount_products dp JOIN discounts d ON dp.discount_id = d.id WHERE d.is_active = 1 AND dp.product_id = ? LIMIT 1", [product.id]).catch(() => [[ ]])
 ]);
 
         let relatedRaw = relRes.rows || [];
@@ -932,6 +934,19 @@ const [varRes, supRes, revRes, relRes, catRes, promotedRes, favCountRes, discoun
             ? parsed.image_urls 
             : (parsed.image_url ? [parsed.image_url] : []);
 
+        // 🟢 1. CLEAR & EASY DISCOUNT EXTRACTION
+        const discountRows = discountRes[0] || [];
+        const activeDiscount = discountRows[0] || null;
+
+        // Discount ka Name (e.g. "Agust Special")
+        const discountName = activeDiscount ? activeDiscount.name : null;
+
+        // Discount ki Expiry Date (Chahe DB mein column ka naam 'expiration' ho, 'end_time' ho ya 'end_date' ho)
+        const discountEndTime = activeDiscount 
+            ? (activeDiscount.expiration || activeDiscount.end_time || activeDiscount.end_date || activeDiscount.valid_until || null)
+            : null;
+
+        // 🟢 2. FINAL RESPONSE OBJECT
         const response = {
             id: parsed.id,
             supplier_id: product.supplier_id,
@@ -946,9 +961,8 @@ const [varRes, supRes, revRes, relRes, catRes, promotedRes, favCountRes, discoun
             status: product.status || 'in_stock',
             
             image_url: parsed.image_url,
-            image_urls: allProductImages, // 🟢 ALL 4 IMAGES SENT TO FRONTEND
+            image_urls: allProductImages,
 
-            // 🟢 4. WARRANTY FIELDS MAPPED
             warranty_type: product.warranty_type || null,
             warranty_details: product.warranty_details || null,
             warranty: product.warranty_details || product.warranty_type || "No Warranty Available",
@@ -989,10 +1003,11 @@ const [varRes, supRes, revRes, relRes, catRes, promotedRes, favCountRes, discoun
                 parent_name: catRes[0][0]?.parent_name || null,
                 parent_slug: catRes[0][0]?.parent_slug || null
             },
+            
+            // 🟢 CLEAN DISCOUNT FIELDS
             is_promoted: promotedRes[0]?.length > 0,
-            discount_label: discountRes[0]?.[0]?.name || null,
-discount_end_time: discountRes[0]?.[0]?.end_time || discountRes[0]?.[0]?.end_date || null,
-
+            discount_label: discountName,       // "Agust Special"
+            discount_end_time: discountEndTime   // "2026-09-09..."
         };
 
         // Save to Redis Cache

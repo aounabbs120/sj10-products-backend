@@ -14,7 +14,7 @@ const internalRoutes = require('../routes/internalRoutes');
 
 const app = express();
 
-// Enable trust proxy for accurate IP detection on Vercel
+// Enable trust proxy for accurate IP detection on Vercel & Nginx
 app.set('trust proxy', 1);
 
 // ==========================================================
@@ -32,7 +32,8 @@ setInterval(() => {
 
 // IP Ban Middleware
 const checkIPBanList = (req, res, next) => {
-    const clientIP = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    // 🚨 FIX: Cloudflare True-Client-IP prioritization
+    const clientIP = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.ip || req.socket.remoteAddress;
     
     if (bannedIPs.has(clientIP)) {
         const expiry = bannedIPs.get(clientIP);
@@ -67,7 +68,8 @@ app.use(helmet({
 // 🤖 3. EXPLOIT SCANNER & BAD BOT BLOCKER (With Auto-Ban)
 // ==========================================================
 const exploitAndBotScanner = (req, res, next) => {
-    const clientIP = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    // 🚨 FIX: Cloudflare True-Client-IP prioritization
+    const clientIP = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.ip || req.socket.remoteAddress;
     const userAgent = req.headers['user-agent'] || '';
     const path = req.path.toLowerCase();
 
@@ -92,6 +94,7 @@ const exploitAndBotScanner = (req, res, next) => {
     next();
 };
 app.use(exploitAndBotScanner);
+
 // ==========================================================
 // 📊 REAL-TIME PULSE-CHECK FOR MONITORING (P1 & P2 ONLY)
 // ==========================================================
@@ -128,6 +131,7 @@ app.get('/api/internal/pulse-check', (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
+
 // ==========================================================
 // 🚥 4. RATE LIMITER (With Auto-Ban for Spammers)
 // ==========================================================
@@ -135,7 +139,8 @@ const apiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
     max: 500, // Limit each IP to 500 requests per window
     handler: (req, res, next, options) => {
-        const clientIP = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+        // 🚨 FIX: Cloudflare True-Client-IP prioritization
+        const clientIP = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.ip || req.socket.remoteAddress;
         // Ban the IP for 6 hours if they hit the limit continuously
         banIPAddress(clientIP, "API Rate limit exceeded (DDoS protection)", 6);
         res.status(429).json({ error: options.message });
