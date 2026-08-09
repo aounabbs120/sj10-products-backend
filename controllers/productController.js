@@ -962,6 +962,7 @@ const [varRes, supRes, revRes, relRes, catRes, promotedRes, favCountRes, discoun
             
             image_url: parsed.image_url,
             image_urls: allProductImages,
+             video_url: product.video_url || null,
 
             warranty_type: product.warranty_type || null,
             warranty_details: product.warranty_details || null,
