@@ -40,6 +40,7 @@ router.get('/explore-feed', productController.getExploreFeed);
 router.get('/popular', productController.getPopularProducts);
 router.get('/banners', productController.getBanners);
 router.get('/strip-banners', productController.getActiveStripBanners);
+router.get('/vertical-banners', productController.getVerticalBanners);
 
 // --- CATEGORY ---
 router.get('/category/:slug', productController.getProductsByCategorySlug);

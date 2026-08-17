@@ -1928,3 +1928,52 @@ exports.getSearchSitemapCount = async (req, res) => {
         res.json({ total: 254 });
     }
 };
+
+/* ======================================================
+   🔥 DEDICATED VERTICAL BANNERS (TiDB + REDIS CACHE)
+   Used strictly for Desktop view with Edge Caching
+   ====================================================== */
+exports.getVerticalBanners = async (req, res) => {
+    const cacheKey = "vertical_banners_master_cache_v1";
+
+    try {
+        // 1. ⚡ Check Redis Super Cache first (Sub-2ms response)
+        if (redis && typeof redis.get === 'function') {
+            try {
+                const cached = await redis.get(cacheKey);
+                if (cached) {
+                    res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=86400, stale-while-revalidate=43200');
+                    return res.json(JSON.parse(cached));
+                }
+            } catch (redisErr) {
+                console.warn("⚠️ [REDIS WARNING] Vertical banners cache read failed.");
+            }
+        }
+
+        console.log("🟢 [TiDB MySQL] Fetching Vertical Banners from database...");
+
+        // 2. Query TiDB MySQL db.inventory
+        const [banners] = await db.inventory.query(
+            "SELECT id, title, image_url, link_url, display_order FROM vertical_banners WHERE is_active = 1 ORDER BY display_order ASC LIMIT 10"
+        );
+
+        const bannerList = banners || [];
+
+        // 3. 💾 Save to Redis for 24 Hours (86400 seconds)
+        if (redis && typeof redis.setEx === 'function' && bannerList.length > 0) {
+            try {
+                await redis.setEx(cacheKey, 86400, JSON.stringify(bannerList));
+            } catch (redisSetErr) {
+                console.warn("⚠️ [REDIS WARNING] Failed to set vertical banners cache.");
+            }
+        }
+
+        // 4. 🔥 Cloudflare Edge & Browser Caching Headers
+        res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=86400, stale-while-revalidate=43200');
+        return res.status(200).json(bannerList);
+
+    } catch (error) {
+        console.error("🔴 Vertical Banners Fetch Error:", error.message);
+        return res.status(200).json([]); // Crash proof fallback
+    }
+};
