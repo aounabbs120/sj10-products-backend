@@ -1,54 +1,57 @@
-// controllers/socialController.js (Product Backend - Direct Supplier & User Notifications)
+// controllers/socialController.js (Product Backend - Direct Dual Alerts with Product Images)
 const db = require('../config/database');
 const axios = require('axios');
+const { v4: uuidv4 } = require('uuid');
+
+let redis = null;
+try {
+    redis = require('../config/redis');
+} catch (e) {}
 
 const ORDERS_BACKEND_URL = (process.env.ORDERS_BACKEND_URL || 'https://orders.sj10.pk').replace(/\/$/, '');
 const SUPPLIER_BACKEND_URL = (process.env.SUPPLIER_BACKEND_URL || 'https://sj1osupplierbackend1.vercel.app').replace(/\/$/, '');
 const INTERNAL_API_KEY = (process.env.INTERNAL_API_KEY || 'Sj10_Internal_AounAbbas_!@2025_#_TopSecret').replace(/['"]/g, '').trim();
 
 // ==============================================================
-// ⚡ 1. HELPER: NOTIFY CUSTOMER VIA ORDER BACKEND
+// ⚡ ASYNC PUSH DISPATCHERS (NON-BLOCKING)
 // ==============================================================
-const notifyCustomer = (userId, title, body, storeLogo) => {
+const sendPushToCustomerApp = (userId, title, body, imageUrl, url) => {
     setImmediate(async () => {
         try {
             await axios.post(`${ORDERS_BACKEND_URL}/api/internal/notify/broadcast`, {
                 userIds: [userId],
-                title: title,
-                body: body,
-                url: '/profile/followed-shops',
-                imageUrl: storeLogo || null
+                title,
+                body,
+                url: url || '/profile/favorites',
+                imageUrl: imageUrl || null
             }, {
                 headers: { 'x-internal-api-key': INTERNAL_API_KEY, 'Content-Type': 'application/json' },
-                timeout: 5000
+                timeout: 6000
             });
-            console.log(`✅ [Customer Push Sent] ${userId}`);
+            console.log(`✅ [User Push Sent] ${userId}`);
         } catch (err) {
-            console.warn(`⚠️ [Customer Push Error]:`, err.response?.data?.message || err.message);
+            console.warn(`⚠️ [User Push Warning]:`, err.response?.data?.message || err.message);
         }
     });
 };
 
-// ==============================================================
-// ⚡ 2. HELPER: DIRECT PING TO SUPPLIER BACKEND (GUJJAR TRICK)
-// ==============================================================
-const notifySupplierDirect = (payload) => {
+const sendPushToSupplierApp = (supplierId, title, body, imageUrl, url, type) => {
     setImmediate(async () => {
         try {
             await axios.post(`${SUPPLIER_BACKEND_URL}/api/internal/notify/social-alert`, {
-                supplierId: payload.supplierId,
-                title: payload.title,
-                body: payload.body,
-                imageUrl: payload.image || null,
-                url: payload.url || '/social/followers',
-                type: payload.type || 'social'
+                supplierId,
+                title,
+                body,
+                imageUrl: imageUrl || null,
+                url: url || '/social/followers',
+                type: type || 'social'
             }, {
                 headers: { 'x-internal-api-key': INTERNAL_API_KEY, 'Content-Type': 'application/json' },
-                timeout: 5000
+                timeout: 6000
             });
-            console.log(`✅ [Supplier Direct Ping SUCCESS] Alert delivered to supplier: ${payload.supplierId}`);
+            console.log(`✅ [Supplier Push Sent] ${supplierId}`);
         } catch (err) {
-            console.warn(`⚠️ [Supplier Direct Ping FAILED]:`, err.response?.data?.message || err.message);
+            console.warn(`⚠️ [Supplier Push Warning]:`, err.response?.data?.message || err.message);
         }
     });
 };
@@ -111,7 +114,7 @@ exports.getMyFavorites = async (req, res) => {
 };
 
 // ==============================================================
-// 🟢 2. TOGGLE PRODUCT FAVORITE (NOTIFIES SUPPLIER WITH PRODUCT IMAGE)
+// 🟢 2. TOGGLE PRODUCT FAVORITE (DUAL USER & SUPPLIER ALERTS WITH PRODUCT IMAGE)
 // ==============================================================
 exports.toggleFavoriteProduct = async (req, res) => {
     const connection = await db.db_social.getConnection();
@@ -128,7 +131,7 @@ exports.toggleFavoriteProduct = async (req, res) => {
         let isFavorite = false;
 
         if (existing.length > 0) {
-            // Remove from Favorites (Silent removal)
+            // Remove from Favorites
             await connection.query("DELETE FROM product_favorites WHERE id = ?", [existing[0].id]);
             await connection.commit();
             isFavorite = false;
@@ -138,18 +141,19 @@ exports.toggleFavoriteProduct = async (req, res) => {
             await connection.commit();
             isFavorite = true;
 
-            // 🟢 ASYNC NOTIFY SUPPLIER DIRECTLY (WITH PRODUCT BANNER IMAGE)
+            // 🟢 ASYNC NOTIFICATIONS TO BOTH USER AND SUPPLIER
             setImmediate(async () => {
                 try {
-                    const [userRows] = await db.users.query("SELECT full_name, profile_pic FROM users WHERE id = ?", [userId]);
+                    const [userRows] = await db.users.query("SELECT full_name FROM users WHERE id = ?", [userId]);
                     const userName = userRows[0]?.full_name || "A Customer";
 
                     const products = await getProductsFromOracleByIds([productId]);
                     if (products.length > 0) {
                         const product = products[0];
                         const supplierId = product.supplier_id;
+                        const productTitle = product.title || "Product";
 
-                        // Parse First Image for Notification Banner
+                        // Parse First Image for Banner
                         let firstImage = null;
                         if (product.image_urls) {
                             try {
@@ -159,19 +163,35 @@ exports.toggleFavoriteProduct = async (req, res) => {
                             } catch (e) { firstImage = product.image_url; }
                         }
 
+                        // 🟢 A. NOTIFY CUSTOMER (Confirmation Alert)
+                        const userTitle = "❤️ Added to Wishlist!";
+                        const userBody = `"${productTitle}" has been added to your favorites.`;
+                        
+                        await db.db_social.query(
+                            `INSERT INTO notification_logs (id, recipient_id, recipient_type, title, body, action_url, image_url, type, is_read, created_at) 
+                             VALUES (UUID(), ?, 'user', ?, ?, ?, ?, 'favorite', 0, NOW())`,
+                            [userId, userTitle, userBody, `/products/${productId}`, firstImage]
+                        ).catch(() => {});
+
+                        sendPushToCustomerApp(userId, userTitle, userBody, firstImage, `/products/${productId}`);
+
+                        // 🟢 B. NOTIFY SUPPLIER (Owner of Product)
                         if (supplierId) {
                             const [supRows] = await db.suppliers.query("SELECT brand_name, full_name FROM suppliers WHERE id = ?", [supplierId]);
                             const supplierName = supRows[0]?.brand_name || supRows[0]?.full_name || "Store";
 
-                            // 🟢 DIRECT PING TO SUPPLIER BACKEND
-                            notifySupplierDirect({
-                                supplierId: supplierId,
-                                title: "❤️ Product Added to Favorites",
-                                body: `Dear ${supplierName}, ${userName} added "${product.title}" to their favorites.`,
-                                image: firstImage, // 🟢 Large Product Banner Image
-                                url: `/products/${productId}`,
-                                type: "product_favorite"
-                            });
+                            const supTitle = "❤️ Product Added to Favorites";
+                            const supBody = `Dear ${supplierName}, ${userName} added "${productTitle}" to their favorites.`;
+
+                            // 1. Direct DB Log for Supplier Bell Icon
+                            await db.db_social.query(
+                                `INSERT INTO notification_logs (id, recipient_id, recipient_type, title, body, action_url, image_url, type, is_read, created_at) 
+                                 VALUES (UUID(), ?, 'supplier', ?, ?, ?, ?, 'favorite', 0, NOW())`,
+                                [supplierId, supTitle, supBody, `/products/${productId}`, firstImage]
+                            ).catch(() => {});
+
+                            // 2. Direct Supplier Push Alert
+                            sendPushToSupplierApp(supplierId, supTitle, supBody, firstImage, `/products/${productId}`, "product_favorite");
                         }
                     }
                 } catch (favErr) {
@@ -181,7 +201,7 @@ exports.toggleFavoriteProduct = async (req, res) => {
         }
 
         res.setHeader('Cache-Control', 'private, no-cache, no-store, must-revalidate');
-        res.json({ 
+        res.status(200).json({ 
             success: true, 
             message: isFavorite ? "Added to favorites" : "Removed from favorites", 
             isFavorite 
@@ -189,6 +209,7 @@ exports.toggleFavoriteProduct = async (req, res) => {
 
     } catch (error) {
         if (connection) await connection.rollback();
+        console.error("🔴 Toggle Favorite Error:", error.message);
         res.status(500).json({ message: "Action failed" });
     } finally {
         connection.release();
@@ -210,7 +231,7 @@ exports.checkFavoriteStatus = async (req, res) => {
 };
 
 // ==============================================================
-// 🟢 4. TOGGLE FOLLOW SUPPLIER (DIRECT DUAL NOTIFICATIONS)
+// 🟢 4. TOGGLE FOLLOW SUPPLIER (DUAL ALERTS)
 // ==============================================================
 exports.toggleFollowSupplier = async (req, res) => {
     const socialConnection = await db.db_social.getConnection();
@@ -250,10 +271,9 @@ exports.toggleFollowSupplier = async (req, res) => {
 
         await socialConnection.commit();
 
-        // 🟢 5. ASYNC NOTIFICATIONS DISPATCH
+        // 🟢 ASYNC NOTIFICATIONS DISPATCH
         setImmediate(async () => {
             try {
-                // Fetch User & Supplier Details
                 const [userRows] = await db.users.query("SELECT full_name, profile_pic FROM users WHERE id = ?", [userId]);
                 const [supRows] = await db.suppliers.query("SELECT brand_name, full_name, profile_pic FROM suppliers WHERE id = ?", [supplierId]);
 
@@ -266,42 +286,51 @@ exports.toggleFollowSupplier = async (req, res) => {
                 const userName = user.full_name || "A Customer";
 
                 if (isFollowing) {
-                    // A. Direct Ping to Supplier Backend (With User DP)
-                    notifySupplierDirect({
-                        supplierId: supplierId,
-                        title: "👤 New Store Follower",
-                        body: `Dear ${storeName}, ${userName} started following your shop.`,
-                        image: userDp,
-                        url: "/social/followers",
-                        type: "new_follower"
-                    });
+                    const supTitle = "👤 New Store Follower";
+                    const supBody = `Dear ${storeName}, ${userName} started following your shop.`;
+                    const userTitle = "🏪 Store Followed";
+                    const userBody = `Dear ${userName}, you started following "${storeName}". You'll receive updates on their latest products!`;
 
-                    // B. Send Push to Customer via Order Backend (With Store Logo)
-                    notifyCustomer(
-                        userId,
-                        "🏪 Store Followed",
-                        `Dear ${userName}, you started following "${storeName}". You'll receive updates on their latest products!`,
-                        storeLogo
-                    );
+                    // 1. Direct DB Log for Supplier Bell Icon
+                    await db.db_social.query(
+                        `INSERT INTO notification_logs (id, recipient_id, recipient_type, title, body, action_url, image_url, type, is_read, created_at) 
+                         VALUES (UUID(), ?, 'supplier', ?, ?, '/social/followers', ?, 'social', 0, NOW())`,
+                        [supplierId, supTitle, supBody, userDp]
+                    ).catch(() => {});
+
+                    // 2. Direct DB Log for User Bell Icon
+                    await db.db_social.query(
+                        `INSERT INTO notification_logs (id, recipient_id, recipient_type, title, body, action_url, image_url, type, is_read, created_at) 
+                         VALUES (UUID(), ?, 'user', ?, ?, '/profile/followed-shops', ?, 'social', 0, NOW())`,
+                        [userId, userTitle, userBody, storeLogo]
+                    ).catch(() => {});
+
+                    // Push Dispatches
+                    sendPushToSupplierApp(supplierId, supTitle, supBody, userDp, "/social/followers", "new_follower");
+                    sendPushToCustomerApp(userId, userTitle, userBody, storeLogo, "/profile/followed-shops");
 
                 } else {
-                    // Unfollow Notice to Supplier Backend
-                    notifySupplierDirect({
-                        supplierId: supplierId,
-                        title: "⚠️ Store Unfollowed",
-                        body: `Dear ${storeName}, ${userName} unfollowed your shop.`,
-                        image: userDp,
-                        url: "/social/followers",
-                        type: "unfollow"
-                    });
+                    const supUnfollowTitle = "⚠️ Store Unfollowed";
+                    const supUnfollowBody = `Dear ${storeName}, ${userName} unfollowed your shop.`;
+                    const userUnfollowTitle = "👋 Store Unfollowed";
+                    const userUnfollowBody = `Dear ${userName}, you unfollowed "${storeName}".`;
 
-                    // Unfollow Notice to Customer
-                    notifyCustomer(
-                        userId,
-                        "👋 Store Unfollowed",
-                        `Dear ${userName}, you unfollowed "${storeName}".`,
-                        storeLogo
-                    );
+                    // DB Log for Supplier
+                    await db.db_social.query(
+                        `INSERT INTO notification_logs (id, recipient_id, recipient_type, title, body, action_url, image_url, type, is_read, created_at) 
+                         VALUES (UUID(), ?, 'supplier', ?, ?, '/social/followers', ?, 'social', 0, NOW())`,
+                        [supplierId, supUnfollowTitle, supUnfollowBody, userDp]
+                    ).catch(() => {});
+
+                    // DB Log for User
+                    await db.db_social.query(
+                        `INSERT INTO notification_logs (id, recipient_id, recipient_type, title, body, action_url, image_url, type, is_read, created_at) 
+                         VALUES (UUID(), ?, 'user', ?, ?, '/profile/followed-shops', ?, 'social', 0, NOW())`,
+                        [userId, userUnfollowTitle, userUnfollowBody, storeLogo]
+                    ).catch(() => {});
+
+                    sendPushToSupplierApp(supplierId, supUnfollowTitle, supUnfollowBody, userDp, "/social/followers", "unfollow");
+                    sendPushToCustomerApp(userId, userUnfollowTitle, userUnfollowBody, storeLogo, "/profile/followed-shops");
                 }
             } catch (asyncErr) {
                 console.warn("Async Follow Notification Error:", asyncErr.message);
